@@ -1,0 +1,90 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sm-parc"
+version = "0.2.1"
+description = "Portable Agent Reputation Credential — a verifiable, recomputable reputation VC consumed at chapter admission"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "labs.stellarminds.ai" }]
+keywords = [
+    "nanda",
+    "reputation",
+    "verifiable-credential",
+    "agent",
+    "did",
+    "ed25519",
+    "trust",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security :: Cryptography",
+    "Typing :: Typed",
+]
+dependencies = [
+    "cryptography>=41.0",
+    "base58>=2.1",
+    "jcs>=0.2,<0.3",  # JCS (RFC 8785) canonicalization — used directly by the proof path
+    # The canonical ARP + VRP impl. PARC composes sm_arp.vrp (behavioral_merkle_root,
+    # nanda-rep/0.2 corroborated scoring, ledger build/verify) from the public PyPI
+    # package; 0.2.x ships the nanda-rep/0.2 API + py.typed.
+    "sm-arp>=0.2.3,<0.3",
+]
+
+[project.urls]
+Homepage = "https://labs.stellarminds.ai"
+Repository = "https://github.com/Sharathvc23/sm-parc"
+Documentation = "https://github.com/Sharathvc23/sm-parc/blob/main/docs/WALKTHROUGH.md"
+"Live demo" = "https://demoparc.stellarminds.ai"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4",
+    "mypy>=1.0",
+    "coverage>=7.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["sm_parc"]
+
+# The published wheel is just the package; the sdist keeps the source + docs + examples
+# but drops the image binaries, CI config, and build output.
+[tool.hatch.build.targets.sdist]
+exclude = ["/docs/images", "/.github", "/dist", "/.benchmarks"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["sm_parc"]
+
+[[tool.mypy.overrides]]
+# jcs / base58 ship no type stubs — treat their imports as untyped rather than
+# failing strict mode on missing stubs.
+module = ["jcs", "base58"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["sm_parc"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 80

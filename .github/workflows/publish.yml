@@ -1,0 +1,48 @@
+name: Publish to PyPI
+
+# Publishes sm-parc to PyPI via OIDC Trusted Publishing (no API tokens) when a
+# version tag is pushed. Configure the trusted publisher once on PyPI:
+#   pypi.org → project sm-parc → Publishing → Add a pending/trusted publisher
+#     Owner:        Sharathvc23
+#     Repository:   sm-parc
+#     Workflow:     publish.yml
+#     Environment:  pypi
+# Then: bump the version in pyproject.toml, tag `vX.Y.Z`, and push the tag.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - run: python -m build
+      - run: python -m twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/sm-parc
+    permissions:
+      id-token: write # OIDC token for Trusted Publishing — the only credential needed
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true # idempotent: re-running a tag whose version is already on PyPI is a no-op
