@@ -91,13 +91,19 @@ the residual, demonstrated rather than asserted.
 ## What the demos do NOT prove
 
 - **The gate cannot *fully* detect a *curated* ledger.** Pointer mode re-runs severance,
-  but only over what the issuer published. A **v0.1 stopgap** narrows this: a verifier may
-  set `policy.required_anchors` — a local allowlist of known-honest dids — and the gate
-  rejects (`anchor_absent`) any fetched ledger that involves none of them. That defeats
-  the *trivial* laundering (publish the ring with no anchor at all — `laundered-visitor`),
-  but **not** the sophisticated case: an issuer that wires one real edge to a required
+  but only over what the issuer published. `policy.required_anchors` narrows this — a
+  local allowlist of known-honest dids; the gate rejects (`anchor_absent`) any ledger
+  that involves none of them. Since 0.2.2 the rule is enforced in **both** admission
+  modes (the inline path previously ignored it silently), fails closed when set without
+  `require_recomputation`, and counts only **verified** involvement: the anchor issued
+  the receipt, or the anchor's co-signature verifies — a junk receipt merely *naming*
+  an anchor no longer launders a ledger through the check. That defeats the *trivial*
+  laundering (`laundered-visitor`) and the mention-injection bypass, but **not** the
+  sophisticated case: an issuer that wires one real corroborated edge to a required
   anchor passes the check and still evades severance. Closing that residual needs an
-  **independent** receipt source (cross-attestation / notary), not the published ledger.
+  **independent** receipt source (cross-attestation / notary — deployed as The Town
+  Notary's `/countersign-parc`, which additionally treats its certified register as
+  the anchor set), not the published ledger.
 - **Denial of service is bounded, not free.** Severance runs over the whole fetched graph;
   `policy.max_ledger_receipts` caps the ledger the gate will process (`ledger_too_large`)
   so a hostile issuer cannot exhaust the verifier with an enormous graph. The bound is the

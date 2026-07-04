@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sm-parc"
-version = "0.2.1"
+version = "0.2.2"
 description = "Portable Agent Reputation Credential — a verifiable, recomputable reputation VC consumed at chapter admission"
 readme = "README.md"
 license = "MIT"

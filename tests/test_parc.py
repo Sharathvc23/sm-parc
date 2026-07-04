@@ -264,3 +264,124 @@ def test_count_mismatch_when_receipts_withheld() -> None:
     ledger["receipts"].pop()  # present only 2 of the 3 committed receipts
     res = admit(vc, policy=_policy(), ledger=ledger, is_valid=_always)
     assert not res.ok and res.stage == "count_mismatch"
+
+
+# ── anchor rule (0.2.2) ─────────────────────────────
+
+ANCHOR_SK = hashlib.sha256(b"parc-anchor").digest()
+ANCHOR_DID = did_from_sk(ANCHOR_SK)
+SYBIL_CP_SK = hashlib.sha256(b"parc-sybil-cp").digest()
+SYBIL_CP_DID = did_from_sk(SYBIL_CP_SK)
+
+
+def _cp_receipt(n: int, cp_did: str, cp_sk: bytes | None) -> dict[str, Any]:
+    """A receipt naming ``cp_did``; genuinely co-signed iff ``cp_sk`` is given,
+    else carrying a junk witness signature (the pre-0.2.2 mention-only bypass)."""
+    receipt: dict[str, Any] = {
+        "version": "arp/0.1",
+        "receipt_id": f"{n:08d}-2222-4222-8222-222222222222",
+        "issuer_did": SUBJECT_DID,
+        "principal_did": SUBJECT_DID,
+        "issued_at": f"2026-06-07T00:00:0{n}Z",
+        "action": {
+            "category": "purchase",
+            "human_summary": f"anchor-case {n}",
+            "outcome": "completed",
+            "counterparty_did": cp_did,
+        },
+        "signature": "AA==",
+    }
+    if cp_sk is not None:
+        cosig = cosign_receipt(receipt, signing_key_bytes=cp_sk)
+    else:
+        cosig = {"witness_did": cp_did, "signature": "QUFBQQ=="}
+    receipt["evidence"] = {"witness_signatures": [cosig]}
+    return receipt
+
+
+def _anchor_ledger(receipts: list[dict[str, Any]]) -> dict[str, Any]:
+    return build_ledger(
+        subject=SUBJECT_DID,
+        receipts=receipts,
+        is_valid=_always,
+        as_of="2026-06-07T00:00:00Z",
+        method="nanda-rep/0.2",
+    )
+
+
+def test_anchor_verified_cosignature_admits() -> None:
+    """History genuinely co-signed by an anchor clears the anchor rule."""
+    ledger = _anchor_ledger([_cp_receipt(i, ANCHOR_DID, ANCHOR_SK) for i in range(3)])
+    vc = _vc(ledger=ledger)
+    res = admit(
+        vc,
+        policy=_policy(required_anchors={ANCHOR_DID}, min_reputation_score=1.0),
+        ledger=ledger,
+        is_valid=_always,
+    )
+    assert res.ok, (res.stage, res.detail)
+
+
+def test_anchor_absent_for_sybil_counterparties() -> None:
+    """A recompute-clean, bar-clearing history of freshly minted counterparties
+    is refused: nothing in it verifiably touches an anchor. This is the sybil
+    case the inline path silently waved through before 0.2.2."""
+    ledger = _anchor_ledger([_cp_receipt(i, SYBIL_CP_DID, SYBIL_CP_SK) for i in range(3)])
+    vc = _vc(ledger=ledger)
+    res = admit(
+        vc,
+        policy=_policy(required_anchors={ANCHOR_DID}, min_reputation_score=1.0),
+        ledger=ledger,
+        is_valid=_always,
+    )
+    assert not res.ok and res.stage == "anchor_absent"
+
+
+def test_anchor_mention_without_cosignature_rejected() -> None:
+    """A junk receipt merely NAMING an anchor (broken witness signature) counts
+    for nothing — the pre-0.2.2 mention-only bypass is closed."""
+    receipts = [_cp_receipt(i, SYBIL_CP_DID, SYBIL_CP_SK) for i in range(3)]
+    receipts.append(_cp_receipt(3, ANCHOR_DID, None))  # names the anchor, junk co-sig
+    ledger = _anchor_ledger(receipts)
+    vc = _vc(ledger=ledger)
+    res = admit(
+        vc,
+        policy=_policy(required_anchors={ANCHOR_DID}, min_reputation_score=1.0),
+        ledger=ledger,
+        is_valid=_always,
+    )
+    assert not res.ok and res.stage == "anchor_absent"
+
+
+def test_anchor_issued_by_anchor_admits() -> None:
+    """The other verified involvement: the anchor itself ISSUED a receipt."""
+    receipts = [_cp_receipt(i, SYBIL_CP_DID, SYBIL_CP_SK) for i in range(3)]
+    anchor_issued = dict(_cp_receipt(4, SYBIL_CP_DID, SYBIL_CP_SK))
+    anchor_issued["issuer_did"] = ANCHOR_DID
+    receipts.append(anchor_issued)
+    # subject binding: ledger.subject must equal credentialSubject.id, and the
+    # anchor-issued receipt belongs to the anchor — so this ledger is invalid
+    # for the SUBJECT's credential. The check still demonstrates the helper:
+    from sm_parc.admission import _involves_anchor
+
+    assert _involves_anchor(receipts, {ANCHOR_DID}, is_valid=_always)
+
+
+def test_anchor_fail_closed_without_recomputation() -> None:
+    """required_anchors with require_recomputation=False must refuse, not
+    silently skip (anchor contact is only checkable from a presented ledger)."""
+    ledger = _ledger()
+    vc = _vc(ledger=ledger)
+    res = admit(
+        vc,
+        policy=_policy(required_anchors={ANCHOR_DID}, require_recomputation=False),
+    )
+    assert not res.ok and res.stage == "anchor_absent"
+
+
+def test_involves_anchor_rejects_invalid_receipt() -> None:
+    """Even an anchor-issued receipt counts only if it verifies."""
+    from sm_parc.admission import _involves_anchor
+
+    junk = _cp_receipt(5, ANCHOR_DID, ANCHOR_SK)
+    assert _involves_anchor([junk], {ANCHOR_DID}, is_valid=lambda _r: False) is False

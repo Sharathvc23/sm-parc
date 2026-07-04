@@ -42,6 +42,7 @@ from sm_arp.vrp import (
     _effective_receipts,
     behavioral_merkle_root,
     corroboration_rate,
+    is_corroborated,
     reputation_score_v2,
     validity_rate,
 )
@@ -66,12 +67,14 @@ class AdmissionPolicy:
     # collusion-resistant nanda-rep/0.2 — a credential carrying any other method
     # (notably the un-corroborated nanda-rep/0.1) is rejected before recomputation.
     required_scoring_method: str = SCORING_METHOD_V2
-    # Pointer-mode stopgap for the curated-ledger residual (until a notary layer
-    # exists): a local allowlist of known-honest "anchor" dids. A fetched ledger that
-    # does NOT involve at least one of these anchors is treated as incomplete and
-    # rejected (anchor_absent) — it defeats the trivial "publish my ring with no anchor"
-    # laundering. Empty set = check disabled. See THREATMODEL.md for the residual that
-    # remains (an attacker who wires one real edge to an anchor still evades severance).
+    # Anchor rule (both admission modes since 0.2.2): a local allowlist of
+    # known-honest "anchor" dids. The presented/fetched ledger must VERIFIABLY
+    # involve at least one anchor — issued by it, or carrying its verifying
+    # co-signature — else the credential is rejected (anchor_absent). This is
+    # the sybil defense: free-to-mint counterparty dids can corroborate their
+    # own receipts, so a recomputable score alone proves arithmetic, not
+    # honesty. Empty set = check disabled. See THREATMODEL.md for the residual
+    # that remains (one real corroborated edge from an anchor still evades).
     required_anchors: set[str] = field(default_factory=set)
     # Deterministic execution budget: the gate runs SCC severance over the whole
     # fetched ledger, so a hostile issuer could publish an enormous graph to exhaust
@@ -238,6 +241,17 @@ def admit(
             return AdmissionResult(
                 False, "root_mismatch", "ledger does not recompute to the credential root"
             )
+        # 6a-bis. Anchor rule (sybil defense): dids are free to mint, so a
+        # recomputable corroborated score alone is forgeable — an attacker
+        # co-signs its own receipts with fresh "counterparties". When the policy
+        # names anchors, the subject's history must VERIFIABLY involve one
+        # (issued by an anchor, or carrying an anchor's verifying co-signature).
+        if policy.required_anchors and not _involves_anchor(
+            receipts, policy.required_anchors, is_valid=is_valid
+        ):
+            return AdmissionResult(
+                False, "anchor_absent", "no verified receipt involves a required anchor"
+            )
         # 6b. Recompute the nanda-rep/0.2 facet (corroborated + collusion-severed)
         # and confirm it matches the signed credentialSubject — a signed-but-inflated
         # score is caught here, and a SELF-DEALT receipt (self-cosigned, no distinct
@@ -264,6 +278,17 @@ def admit(
         ):
             return AdmissionResult(False, "score_mismatch", "corroboration_rate does not recompute")
 
+    if not policy.require_recomputation and policy.required_anchors:
+        # Fail closed: anchor contact can only be established from a presented,
+        # recomputable ledger. Silently skipping the check (the pre-0.2.2
+        # behavior for the inline path) turned a configured defense into a
+        # no-op.
+        return AdmissionResult(
+            False,
+            "anchor_absent",
+            "required_anchors needs require_recomputation (a presented ledger)",
+        )
+
     if float(subject.get("reputation_score", 0)) < policy.min_reputation_score:
         return AdmissionResult(False, "below_threshold", "reputation_score below policy minimum")
     if float(subject.get("validity_rate", 0)) < policy.min_validity_rate:
@@ -272,12 +297,30 @@ def admit(
     return AdmissionResult.admitted()
 
 
-def _involves_anchor(receipts: list[dict[str, Any]], anchors: set[str]) -> bool:
-    """True iff any receipt is issued by, or transacted with, a required anchor did."""
+def _involves_anchor(
+    receipts: list[dict[str, Any]], anchors: set[str], *, is_valid: IsValid
+) -> bool:
+    """True iff some receipt VERIFIABLY involves a required anchor did.
+
+    Verifiably, not nominally: a receipt merely *naming* an anchor counts for
+    nothing (an attacker can insert one junk receipt naming an anchor into an
+    otherwise-laundered ledger). An anchor is involved iff either
+
+    * the anchor **issued** the receipt and the receipt passes ``is_valid``
+      (the anchor itself signed it), or
+    * the anchor is the receipt's **counterparty**, the receipt passes
+      ``is_valid``, and the anchor's co-signature verifies
+      (:func:`sm_arp.vrp.is_corroborated`) — the anchor genuinely attested
+      the interaction.
+    """
     for r in receipts:
-        if r.get("issuer_did") in anchors:
+        if r.get("issuer_did") in anchors and is_valid(r):
             return True
-        if (r.get("action") or {}).get("counterparty_did") in anchors:
+        if (
+            (r.get("action") or {}).get("counterparty_did") in anchors
+            and is_valid(r)
+            and is_corroborated(r)
+        ):
             return True
     return False
 
@@ -361,9 +404,11 @@ def admit_over_published_ledger(
     # known-honest anchor, else it is treated as incomplete (defeats the trivial
     # "publish my ring with no honest anchor" laundering). Disabled when the policy
     # carries no anchors.
-    if policy.required_anchors and not _involves_anchor(receipts, policy.required_anchors):
+    if policy.required_anchors and not _involves_anchor(
+        receipts, policy.required_anchors, is_valid=is_valid
+    ):
         return AdmissionResult(
-            False, "anchor_absent", "fetched ledger involves no required anchor (incomplete)"
+            False, "anchor_absent", "fetched ledger involves no verified required anchor"
         )
     ledger_wide = reputation_score_v2(receipts, is_valid=is_valid)
     if abs(ledger_wide - float(subject.get("reputation_score", 0))) > policy.score_tolerance:
