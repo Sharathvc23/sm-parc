@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.3] — 2026-07-08
+
+Compatibility release — no behavior change.
+
+### Changed
+- **Lifted the `sm-arp<0.3` cap to `<0.4`.** sm-arp 0.3.0 (the DAT bridge) is
+  backward compatible — its new `verify_authority_chain` hooks are opt-in and
+  the pre-bridge behavior is preserved when they aren't passed. The full
+  sm-parc suite passes unchanged against sm-arp 0.3.0. This unblocks
+  downstreams that were forced to hold sm-arp at 0.2.3 solely because of this
+  cap (they can now unify on 0.3.0).
+
+### Fixed
+- **`__version__` no longer drifts from the dist metadata** (#1): it was stuck
+  at `"0.2.0"` while the package published 0.2.2.
+
 ## [0.2.2] — 2026-07-03
 
 Security release: the anchor rule now actually defends what it claims to.
