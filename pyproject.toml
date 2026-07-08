@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sm-parc"
-version = "0.2.2"
+version = "0.2.3"
 description = "Portable Agent Reputation Credential — a verifiable, recomputable reputation VC consumed at chapter admission"
 readme = "README.md"
 license = "MIT"
@@ -36,7 +36,7 @@ dependencies = [
     # The canonical ARP + VRP impl. PARC composes sm_arp.vrp (behavioral_merkle_root,
     # nanda-rep/0.2 corroborated scoring, ledger build/verify) from the public PyPI
     # package; 0.2.x ships the nanda-rep/0.2 API + py.typed.
-    "sm-arp>=0.2.3,<0.3",
+    "sm-arp>=0.2.3,<0.4",
 ]
 
 [project.urls]

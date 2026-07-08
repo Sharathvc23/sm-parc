@@ -28,7 +28,7 @@ from .credential import (
 )
 from .disclosure import InclusionProof, inclusion_proof, verify_inclusion
 
-__version__ = "0.2.0"
+__version__ = "0.2.3"
 
 __all__ = [
     "AdmissionPolicy",
