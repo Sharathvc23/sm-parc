@@ -14,6 +14,9 @@ collusion-resistant scoring + ledger verify) from the public ``sm-arp`` package.
 
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
+from importlib.metadata import version as _dist_version
+
 from .admission import (
     AdmissionPolicy,
     AdmissionResult,
@@ -28,7 +31,15 @@ from .credential import (
 )
 from .disclosure import InclusionProof, inclusion_proof, verify_inclusion
 
-__version__ = "0.2.3"
+# Derived from installed distribution metadata, never hand-maintained. A literal
+# here is a second copy of pyproject's ``version`` with nothing comparing them —
+# the shape that shipped sm-provision 0.1.0 reporting "0.0.1" and sm-authority
+# 0.1.0 reporting the same wrong value from the same template. Correct today is
+# not the test; it drifts at the next bump.
+try:  # pragma: no cover - trivial branch, both sides asserted in tests
+    __version__ = _dist_version("sm-parc")
+except _PackageNotFoundError:  # running from a source tree, not installed
+    __version__ = "0.0.0.dev0"
 
 __all__ = [
     "AdmissionPolicy",
