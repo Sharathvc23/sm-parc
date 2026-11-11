@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sm-parc"
-version = "0.2.3"
+version = "0.3.0"
 description = "Portable Agent Reputation Credential — a verifiable, recomputable reputation VC consumed at chapter admission"
 readme = "README.md"
 license = "MIT"
@@ -35,8 +35,9 @@ dependencies = [
     "jcs>=0.2,<0.3",  # JCS (RFC 8785) canonicalization — used directly by the proof path
     # The canonical ARP + VRP impl. PARC composes sm_arp.vrp (behavioral_merkle_root,
     # nanda-rep/0.2 corroborated scoring, ledger build/verify) from the public PyPI
-    # package; 0.2.x ships the nanda-rep/0.2 API + py.typed.
-    "sm-arp>=0.2.3,<0.4",
+    # package; 0.4.0 excludes evidence.witness_signatures from the canonical bytes, so
+    # a real ARP receipt stays verifiable after a counterparty co-signs it.
+    "sm-arp>=0.4.0,<0.5",
 ]
 
 [project.urls]

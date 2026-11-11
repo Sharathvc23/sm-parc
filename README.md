@@ -39,10 +39,25 @@ A full picture-by-picture tour is in [`docs/WALKTHROUGH.md`](./docs/WALKTHROUGH.
   score: a credential carrying the un-corroborated `nanda-rep/0.1` score is rejected, and
   a wash-trading ring's self-dealt receipts are severed to a score of ~0, so it fails the
   threshold.
-- **Adversarially tested.** Hostile-path tests for: tampered credential, untrusted issuer,
-  tampered ledger (root mismatch), issuer-inflated-and-re-signed score (score mismatch),
-  0.1-facet rejection, un-corroborated/severed score, below-threshold, stale, revoked,
-  wrong-mode, and refs-only (non-recomputable).
+- **Bound to its presenter.** `admit(..., presenter_did=...)` admits a credential only for
+  its own `credentialSubject.id` — the did the chapter *authenticated* for the connecting
+  agent. A copied credential + ledger is public bytes; nobody else can replay it
+  (`presenter_mismatch`). The inline ledger must also be the subject's *own* history:
+  every receipt's `issuer_did` must equal the subject (`ledger_subject_mismatch`), so an
+  agent cannot be admitted on someone else's honestly-signed receipts.
+- **Expires on the real clock.** The validity window is enforced against the UTC wall
+  clock by default (`now` is injectable for tests) and compared as RFC 3339 *instants*,
+  not strings — an offset other than `Z` cannot defeat it. Every credential carries an
+  `id` (the builder generates a `urn:uuid` if you don't supply one) and the gate refuses
+  one without (`missing_id`), so every credential *can* be revoked.
+- **Adversarially tested — with the real verifier.** Hostile-path tests for: tampered
+  credential, untrusted issuer, tampered ledger (root mismatch),
+  issuer-inflated-and-re-signed score (score mismatch), 0.1-facet rejection,
+  un-corroborated/severed score, below-threshold, stale (default clock and offset
+  tricks), not-yet-valid, revoked, missing id, wrong presenter, another agent's ledger,
+  oversized ledger, malformed facet, wrong-mode, and refs-only (non-recomputable).
+  `tests/test_end_to_end_real_verifier.py` runs the whole path on real sm-arp receipts
+  with real counterparty co-signatures and `is_valid=lambda r: verify_receipt(r).ok`.
 
 A **valid signature is not admission** — the gate trusts the issuer's key, then recomputes
 the score and applies its own threshold, so a genuinely-signed wash credential is still
@@ -87,6 +102,21 @@ root without exposing the rest:
 
 Runnable: [`examples/three_city_economy.py`](./examples/three_city_economy.py).
 
+## Production policies MUST set `required_anchors`
+
+> **The default `AdmissionPolicy()` leaves the sybil defence OFF.** `required_anchors`
+> defaults to the empty set, and with no anchors configured **three freshly minted dids
+> can forge a recompute-clean, bar-clearing credential**: an attacker issues receipts to
+> itself, co-signs them with its own throwaway "counterparties", and every arithmetic
+> check passes — the gate verifies that the maths is right, not that anyone real was
+> involved. The anchor rule is what ties a history to at least one known-honest did.
+>
+> The gate will not change your scores behind your back, but it will not stay quiet
+> either: every `AdmissionResult` from a policy with no anchors carries
+> `warnings == ["anchor_check_disabled"]`. Treat that warning in production the way you
+> would treat TLS verification being off. Populate `required_anchors` with the dids of
+> issuers/counterparties you trust (see `SPEC.md` §3.3 and `THREATMODEL.md`).
+
 ## What this package does NOT (yet) do
 
 - **Run the auditor.** PARC *verifies* an auditor's attestation; who computes and signs it
@@ -102,7 +132,10 @@ Runnable: [`examples/three_city_economy.py`](./examples/three_city_economy.py).
 
 - `build_reputation_credential(...)` / `verify_credential_proof(...)` — issue + verify the VC.
 - `AdmissionPolicy` + `admit(...)` — the inline chapter-admission gate (signature →
-  trusted issuer → revocation/freshness → recompute root + scores → thresholds).
+  trusted issuer → id/revocation → validity window on the real clock → presenter binding
+  → budget → subject-bound recompute of root + scores → thresholds). Every
+  `AdmissionResult` carries `stage`, `detail` and `warnings` (defences the policy left
+  disabled).
 - `admit_over_published_ledger(...)` + `subject_severed_score(...)` — the pointer-mode
   gate: fetch the named ledger, re-verify the root, and derive the subject's
   collusion-severed score over the full community graph.
@@ -113,7 +146,7 @@ Runnable: [`examples/three_city_economy.py`](./examples/three_city_economy.py).
 ## Installation
 
 ```bash
-pip install sm-parc          # depends on sm-arp>=0.2.3,<0.3 (carries sm_arp.vrp)
+pip install sm-parc          # depends on sm-arp>=0.4.0,<0.5 (carries sm_arp.vrp)
 # working draft: pip install git+https://github.com/Sharathvc23/sm-parc.git
 ```
 
@@ -132,10 +165,63 @@ vc = build_reputation_credential(ledger=ledger, issuer_sk=chapter_sk,
                                  valid_until="2026-07-07T00:00:00Z")
 
 # A new chapter admits the agent — verifies the signature AND recomputes the ledger.
-policy = AdmissionPolicy(trusted_issuers={chapter_did}, min_reputation_score=50.0)
-result = admit(vc, policy=policy, ledger=ledger, is_valid=lambda r: verify_receipt(r).ok)
-assert result.ok  # admitted, without trusting the issuing chapter's server
+# `presenter_did` is the did the chapter AUTHENTICATED for the connecting agent (e.g.
+# the key that signed the admission request) — never read out of the credential.
+# `now` defaults to the UTC wall clock; pass an RFC 3339 instant to pin it in tests.
+policy = AdmissionPolicy(
+    trusted_issuers={chapter_did},
+    required_anchors={anchor_did},   # production: MUST be set, see above
+    min_reputation_score=50.0,
+    max_ledger_receipts=10_000,      # execution budget, both admission modes
+)
+result = admit(
+    vc,
+    policy=policy,
+    presenter_did=authenticated_did,
+    ledger=ledger,
+    is_valid=lambda r: verify_receipt(r).ok,
+)
+assert result.ok and not result.warnings  # admitted, without trusting the issuer's server
 ```
+
+## Upgrading from 0.2.x to 0.3.0
+
+0.3.0 is a **breaking** release of the gate API (SemVer minor while the package is
+pre-1.0). The credential wire shape (`parc/0.1`) is unchanged except that `id` is now
+always present.
+
+1. **`presenter_did` is a required keyword** on both `admit(...)` and
+   `admit_over_published_ledger(...)`. Pass the did your chapter has *authenticated* for
+   the agent presenting the credential. The gate rejects `presenter_mismatch` unless it
+   equals `credentialSubject.id`. Do **not** pass `vc["credentialSubject"]["id"]` — that
+   re-opens the replay hole the parameter closes.
+
+   ```python
+   # 0.2.x
+   admit(vc, policy=policy, ledger=ledger, is_valid=is_valid, now=now)
+   # 0.3.0
+   admit(vc, policy=policy, presenter_did=session_did, ledger=ledger, is_valid=is_valid)
+   ```
+
+2. **`now` defaults to the real clock.** In 0.2.x omitting `now` skipped the validity
+   window entirely; expired credentials were admitted. Code that relied on that (tests
+   with fixed-date fixtures, mostly) must inject `now` as an RFC 3339 string *with an
+   offset* or an offset-aware `datetime`. Naive values are rejected as `malformed`.
+3. **Credentials without `id` are rejected** (`missing_id`); `build_reputation_credential`
+   now always emits one (`urn:uuid:…` when `credential_id` is omitted). Re-mint any
+   id-less credentials in circulation.
+4. **Inline ledgers must be the subject's own**: every receipt's `issuer_did` must equal
+   `credentialSubject.id` (`ledger_subject_mismatch`). Pointer-mode community ledgers are
+   multi-issuer by design and are not subject to this rule.
+5. **`max_ledger_receipts` now applies inline too** (`ledger_too_large`, before any
+   hashing). If you set it for pointer mode, it now also bounds presented ledgers.
+6. **Validity bounds must be RFC 3339 instants with an offset**, both at mint time
+   (`ValueError`) and at the gate (`malformed`). A credential missing `validUntil` is no
+   longer "unbounded"; it is refused.
+7. **New `AdmissionResult.warnings`** — currently `["anchor_check_disabled"]` whenever
+   `required_anchors` is empty. Log it; alert on it in production.
+8. Requires **sm-arp ≥ 0.4.0** (canonical bytes exclude `evidence.witness_signatures`, so
+   a real receipt stays verifiable after a counterparty co-signs it).
 
 See [`examples/mint_and_admit.py`](./examples/mint_and_admit.py) for a runnable end-to-end
 demo (honest corroborated agent admitted; wash-trade agent rejected).
@@ -169,4 +255,4 @@ keys and exercises every admission outcome. The suite IS the spec (see
 
 Built at [labs.stellarminds.ai](https://labs.stellarminds.ai).
 
-*First published: 2026-06-07 | Last modified: 2026-06-21*
+*First published: 2026-06-07 | Last modified: 2026-11-11*
