@@ -225,11 +225,15 @@ def published_store() -> dict[str, dict[str, Any]]:
     return {COMMUNITY_URI: community_ledger(), CURATED_URI: curated_ledger()}
 
 
-def city_b_admits(vc: dict[str, Any], store: dict[str, dict[str, Any]]) -> AdmissionResult:
+def city_b_admits(
+    vc: dict[str, Any], store: dict[str, dict[str, Any]], *, presenter_did: str
+) -> AdmissionResult:
     """City B: fetch the named ledger, re-verify + re-sever it, decide admission.
 
     City B trusts the did:key of BOTH issuers (A and the colluding C) — the laundering
     happens *inside* the allowlist, which is the whole point of the residual.
+    ``presenter_did`` is the did City B authenticated for the visitor; the gate admits
+    the credential only for its own subject.
     """
     policy = AdmissionPolicy(
         trusted_issuers={CITY_A_DID, CITY_C_DID},
@@ -237,7 +241,12 @@ def city_b_admits(vc: dict[str, Any], store: dict[str, dict[str, Any]]) -> Admis
         min_reputation_score=MIN_SCORE,
     )
     return admit_over_published_ledger(
-        vc, policy=policy, fetch=lambda uri: store[uri], is_valid=always_valid, now=NOW
+        vc,
+        policy=policy,
+        presenter_did=presenter_did,
+        fetch=lambda uri: store[uri],
+        is_valid=always_valid,
+        now=NOW,
     )
 
 
@@ -292,7 +301,7 @@ def build_fixture() -> dict[str, Any]:
             ledger_uri=c["ledger_uri"],
             cred_id=c["cred_id"],
         )
-        result = city_b_admits(vc, store)
+        result = city_b_admits(vc, store, presenter_did=c["subject"])
         severed = subject_severed_score(receipts, subject=c["subject"], is_valid=always_valid)
         # The naive 0.1 score over the subject's own receipts — high for every case,
         # which is exactly why the ledger-wide severance (not the per-agent total) is
@@ -371,7 +380,7 @@ def main() -> None:
             ledger_uri=c["ledger_uri"],
             cred_id=c["cred_id"],
         )
-        result = city_b_admits(vc, store)
+        result = city_b_admits(vc, store, presenter_did=c["subject"])
         results[c["case"]] = result
         severed = subject_severed_score(receipts, subject=c["subject"], is_valid=always_valid)
         own = [r for r in receipts if r.get("issuer_did") == c["subject"]]

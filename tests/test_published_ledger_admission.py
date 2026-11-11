@@ -55,6 +55,13 @@ def _store() -> dict[str, dict[str, Any]]:
     return published_store()
 
 
+_SUBJECT = {
+    "honest-visitor": HONEST_DID,
+    "ring-visitor": RING_VISITOR_DID,
+    "laundered-visitor": RING_VISITOR_DID,
+}
+
+
 def _issue(case: str) -> dict[str, Any]:
     """Issue the signed pointer credential for a named demo case over the store."""
     store = _store()
@@ -78,28 +85,60 @@ def _issue(case: str) -> dict[str, Any]:
 
 
 def test_honest_anchor_member_is_admitted() -> None:
-    result = city_b_admits(_issue("honest-visitor"), _store())
+    result = city_b_admits(_issue("honest-visitor"), _store(), presenter_did=HONEST_DID)
     assert result.ok and result.stage == "admitted"
 
 
 def test_ring_member_is_severed_and_rejected() -> None:
-    result = city_b_admits(_issue("ring-visitor"), _store())
+    result = city_b_admits(_issue("ring-visitor"), _store(), presenter_did=RING_VISITOR_DID)
     assert not result.ok
     assert result.stage == "below_threshold"
 
 
 def test_laundered_curated_ledger_is_wrongly_admitted() -> None:
     """The completeness residual: a colluding issuer that omits the anchor gets in."""
-    result = city_b_admits(_issue("laundered-visitor"), _store())
+    result = city_b_admits(_issue("laundered-visitor"), _store(), presenter_did=RING_VISITOR_DID)
     assert result.ok and result.stage == "admitted"
 
 
 def test_same_agent_opposite_outcome_only_ledger_differs() -> None:
     """ring-visitor and laundered-visitor are the identical DID + identical receipts;
     only the published ledger's completeness flips the decision."""
-    ring = city_b_admits(_issue("ring-visitor"), _store())
-    laundered = city_b_admits(_issue("laundered-visitor"), _store())
+    ring = city_b_admits(_issue("ring-visitor"), _store(), presenter_did=RING_VISITOR_DID)
+    laundered = city_b_admits(_issue("laundered-visitor"), _store(), presenter_did=RING_VISITOR_DID)
     assert not ring.ok and laundered.ok
+
+
+def test_pointer_credential_bound_to_its_presenter() -> None:
+    """A public pointer credential cannot be replayed by another did: the anchor
+    member's credential presented by the ring member is refused before any fetch."""
+    fetched: list[str] = []
+    store = _store()
+
+    def fetch(uri: str) -> dict[str, Any]:
+        fetched.append(uri)
+        return store[uri]
+
+    result = admit_over_published_ledger(
+        _issue("honest-visitor"),
+        policy=_policy(),
+        presenter_did=RING_VISITOR_DID,
+        fetch=fetch,
+        is_valid=always_valid,
+        now=NOW,
+    )
+    assert not result.ok and result.stage == "presenter_mismatch"
+    assert fetched == []  # rejected on the envelope; the ledger host is never contacted
+
+
+def test_community_ledger_is_multi_issuer_by_design() -> None:
+    """Pointer mode scores a MULTI-issuer community ledger; the inline-only rule
+    "every receipt issued by the subject" does not apply. Subject binding there is
+    the derived score (only the subject's own receipts count)."""
+    receipts = _store()[COMMUNITY_URI]["receipts"]
+    assert len({r["issuer_did"] for r in receipts}) > 1
+    result = city_b_admits(_issue("honest-visitor"), _store(), presenter_did=HONEST_DID)
+    assert result.ok
 
 
 # --- the gate derives the score (it is not attested) ------------------------
@@ -144,7 +183,12 @@ def test_tampered_fetched_ledger_fails_root() -> None:
     tampered["receipts"] = receipts
     store[COMMUNITY_URI] = tampered
     result = admit_over_published_ledger(
-        vc, policy=_policy(), fetch=lambda uri: store[uri], is_valid=always_valid, now=NOW
+        vc,
+        policy=_policy(),
+        presenter_did=HONEST_DID,
+        fetch=lambda uri: store[uri],
+        is_valid=always_valid,
+        now=NOW,
     )
     assert not result.ok and result.stage == "root_mismatch"
 
@@ -156,7 +200,12 @@ def test_withheld_receipt_fails_count_or_root() -> None:
     short["receipts"] = short["receipts"][:-1]
     store[COMMUNITY_URI] = short
     result = admit_over_published_ledger(
-        vc, policy=_policy(), fetch=lambda uri: store[uri], is_valid=always_valid, now=NOW
+        vc,
+        policy=_policy(),
+        presenter_did=HONEST_DID,
+        fetch=lambda uri: store[uri],
+        is_valid=always_valid,
+        now=NOW,
     )
     assert not result.ok and result.stage in {"count_mismatch", "root_mismatch"}
 
@@ -184,7 +233,12 @@ def test_mis_attested_ledger_wide_score_fails() -> None:
         ledger_uri=COMMUNITY_URI,
     )
     result = admit_over_published_ledger(
-        vc, policy=_policy(), fetch=lambda uri: store[uri], is_valid=always_valid, now=NOW
+        vc,
+        policy=_policy(),
+        presenter_did=HONEST_DID,
+        fetch=lambda uri: store[uri],
+        is_valid=always_valid,
+        now=NOW,
     )
     assert not result.ok and result.stage == "score_mismatch"
 
@@ -198,7 +252,12 @@ def test_untrusted_issuer_rejected() -> None:
     )
     store = _store()
     result = admit_over_published_ledger(
-        vc, policy=policy, fetch=lambda uri: store[uri], is_valid=always_valid, now=NOW
+        vc,
+        policy=policy,
+        presenter_did=HONEST_DID,
+        fetch=lambda uri: store[uri],
+        is_valid=always_valid,
+        now=NOW,
     )
     assert not result.ok and result.stage == "untrusted_issuer"
 
@@ -220,7 +279,12 @@ def test_inline_credential_rejected_by_pointer_gate() -> None:
         valid_until=VALID_UNTIL,
     )  # no ledger_uri
     result = admit_over_published_ledger(
-        vc, policy=_policy(), fetch=lambda uri: {}, is_valid=always_valid, now=NOW
+        vc,
+        policy=_policy(),
+        presenter_did=HONEST_DID,
+        fetch=lambda uri: {},
+        is_valid=always_valid,
+        now=NOW,
     )
     assert not result.ok and result.stage == "wrong_mode"
 
@@ -234,6 +298,7 @@ def test_pointer_credential_rejected_by_inline_gate() -> None:
     result = admit(
         ring_vc,
         policy=AdmissionPolicy(trusted_issuers={CITY_A_DID}, min_reputation_score=MIN_SCORE),
+        presenter_did=RING_VISITOR_DID,
         ledger=store[COMMUNITY_URI],
         is_valid=always_valid,
         now=NOW,
@@ -256,6 +321,7 @@ def test_stale_credential_rejected() -> None:
     result = admit_over_published_ledger(
         vc,
         policy=_policy(),
+        presenter_did=HONEST_DID,
         fetch=lambda uri: store[uri],
         is_valid=always_valid,
         now="2030-01-01T00:00:00Z",
@@ -283,6 +349,7 @@ def test_required_anchor_rejects_curated_ledger() -> None:
     result = admit_over_published_ledger(
         _issue("laundered-visitor"),
         policy=_policy_with(required_anchors={HONEST_DID}),
+        presenter_did=RING_VISITOR_DID,
         fetch=lambda uri: store[uri],
         is_valid=always_valid,
         now=NOW,
@@ -297,6 +364,7 @@ def test_required_anchor_passes_complete_ledger() -> None:
     result = admit_over_published_ledger(
         _issue("ring-visitor"),
         policy=_policy_with(required_anchors={HONEST_DID}),
+        presenter_did=RING_VISITOR_DID,
         fetch=lambda uri: store[uri],
         is_valid=always_valid,
         now=NOW,
@@ -310,11 +378,27 @@ def test_required_anchor_disabled_by_default() -> None:
     result = admit_over_published_ledger(
         _issue("laundered-visitor"),
         policy=_policy_with(),
+        presenter_did=RING_VISITOR_DID,
         fetch=lambda uri: store[uri],
         is_valid=always_valid,
         now=NOW,
     )
     assert result.ok  # the residual the anchor list is meant to close
+    # ...and the gate says so: the disabled defence is named on the result.
+    assert result.warnings == ["anchor_check_disabled"]
+
+
+def test_required_anchor_set_clears_the_warning() -> None:
+    store = _store()
+    result = admit_over_published_ledger(
+        _issue("honest-visitor"),
+        policy=_policy_with(required_anchors={HONEST_DID}),
+        presenter_did=HONEST_DID,
+        fetch=lambda uri: store[uri],
+        is_valid=always_valid,
+        now=NOW,
+    )
+    assert result.ok and result.warnings == []
 
 
 def test_max_ledger_receipts_rejects_oversized() -> None:
@@ -324,6 +408,7 @@ def test_max_ledger_receipts_rejects_oversized() -> None:
     result = admit_over_published_ledger(
         _issue("honest-visitor"),
         policy=_policy_with(max_ledger_receipts=2),
+        presenter_did=HONEST_DID,
         fetch=lambda uri: store[uri],
         is_valid=always_valid,
         now=NOW,

@@ -4,6 +4,81 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] — 2026-11-11
+
+Security release from the 2026-11 audit. **Breaking**: `admit` and
+`admit_over_published_ledger` take a required `presenter_did` keyword, and the
+validity window is enforced against the real clock by default. Migration notes are
+in the README ("Upgrading from 0.2.x to 0.3.0").
+
+### Security
+- **Expiry was opt-in and string-compared.** `now` defaulted to `None`, which
+  skipped both window checks — an expired credential was admitted whenever the
+  caller passed no clock — and the comparison was lexical, so a `+05:00` offset
+  defeated it. `now` now defaults to `datetime.now(UTC)`; `now`, `validFrom` and
+  `validUntil` are parsed as offset-aware RFC 3339 instants (naive, missing or
+  unparseable → `malformed`) and compared as instants. `now` stays injectable
+  (RFC 3339 string or aware `datetime`) for tests.
+- **No presenter binding.** A credential + ledger is public bytes and nothing
+  checked who presented it; anyone holding a copy was admitted as its subject.
+  Both gates now take `presenter_did` — the did the verifier authenticated for
+  the connecting agent — and reject `presenter_mismatch` unless it equals
+  `credentialSubject.id`.
+- **Another agent's ledger was admitted under the subject.** An issuer-signed
+  inline ledger of agent Y's receipts labelled with subject X recomputed
+  perfectly (root, count, scores) and admitted X on Y's reputation. The inline
+  gate now requires every receipt's `issuer_did == credentialSubject.id`
+  (`ledger_subject_mismatch`). Pointer-mode community ledgers are multi-issuer
+  by design and bind the subject through the derived per-subject score instead.
+- **Revocation was unenforceable for id-less credentials.**
+  `build_reputation_credential(credential_id=None)` omitted `id`, and the gate
+  keys revocation on `vc.id`. The builder now always emits an `id`
+  (`urn:uuid:<uuid4>` when none is supplied; an empty string raises) and the
+  gate rejects a credential without one (`missing_id`).
+- **`max_ledger_receipts` was pointer-mode only.** The inline gate now enforces
+  it too, BEFORE any hashing or recomputation (`ledger_too_large`).
+- **Non-numeric facet values raised out of the gate.** `float()` on a string,
+  `None`, list or bool score crashed the verifier; they are now a `malformed`
+  rejection. NaN/Infinity (which would pass both the tolerance and threshold
+  comparisons) are refused as well — JCS cannot encode them, so such a
+  credential also fails the proof.
+
+### Added
+- **`AdmissionResult.warnings`** — structured list of defences the policy left
+  disabled. Today: `anchor_check_disabled` whenever `required_anchors` is empty,
+  on every result (admitted or rejected). The default policy is unchanged and
+  scores are never altered; README/SPEC/THREATMODEL now say plainly that a
+  production policy MUST set anchors (three fresh dids forge a recompute-clean
+  credential without them).
+- **`parse_rfc3339_instant`** and **`WARNING_ANCHOR_CHECK_DISABLED`** exported.
+- **Real-verifier end-to-end suite** (`tests/test_end_to_end_real_verifier.py`):
+  real sm-arp receipts issued and signed by the agent, co-signed by real
+  counterparties (`sm_arp.vrp.cosign_receipt`), scored by `build_ledger` and
+  admitted with `is_valid=lambda r: sm_arp.verify_receipt(r).ok` — trusted issuer
+  admitted; untrusted / tampered score / proof removed / expired on the default
+  clock / wrong presenter / another agent's ledger / over cap / forged receipt
+  signature all rejected. Every other test module stubbed validity with
+  `_always` and `"AA=="` signatures, so the production composition had never
+  been exercised.
+- Hostile-path tests for every new stage (`missing_id`, `malformed`,
+  `presenter_mismatch`, `ledger_subject_mismatch`, inline `ledger_too_large`),
+  for the offset-defeats-string-comparison case, and for the warning.
+
+### Changed
+- **`build_reputation_credential` validates the window**: `valid_from` /
+  `valid_until` must be RFC 3339 instants with an offset and `valid_from` must
+  not be after `valid_until`, else `ValueError` — rather than minting a
+  credential every 0.3.0 gate rejects as `malformed`.
+- **sm-arp pin raised to `>=0.4.0,<0.5`.** 0.4.0's canonical bytes exclude
+  `evidence.witness_signatures`, so a real ARP receipt stays verifiable after a
+  counterparty co-signs it — which is what makes the real-verifier suite
+  possible. (The README's install line still said `<0.3`; fixed.)
+- Examples (`mint_and_admit`, `two_city_admission`, `published_ledger_admission`,
+  `three_city_economy`) pass the authenticated presenter explicitly and print the
+  gate's warnings.
+- CI installs sm-arp 0.4.0 from its merged commit on GitHub until that version is
+  on PyPI; the step is marked for removal once it is.
+
 ## [0.2.3] — 2026-07-08
 
 Compatibility release — no behavior change.

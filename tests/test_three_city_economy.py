@@ -61,7 +61,11 @@ def test_enterprise_admits_on_signed_aggregate_without_full_ledger() -> None:
     revealed = [receipts[i] for i in REVEALED_INDICES]
     proofs = [inclusion_proof(receipts, receipt=r) for r in revealed]
     result, disclosed_ok = admit_with_disclosure(
-        bar=float(CITIES["C"]["bar"]), vc=artifact["vc"], revealed=revealed, proofs=proofs
+        bar=float(CITIES["C"]["bar"]),
+        vc=artifact["vc"],
+        revealed=revealed,
+        proofs=proofs,
+        presenter_did=receipts[0]["issuer_did"],
     )
     assert result.ok and result.stage == "admitted"
     assert disclosed_ok

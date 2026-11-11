@@ -18,6 +18,7 @@ from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
 from importlib.metadata import version as _dist_version
 
 from .admission import (
+    WARNING_ANCHOR_CHECK_DISABLED,
     AdmissionPolicy,
     AdmissionResult,
     admit,
@@ -27,6 +28,7 @@ from .admission import (
 from .credential import (
     build_reputation_credential,
     did_from_private_key,
+    parse_rfc3339_instant,
     verify_credential_proof,
 )
 from .disclosure import InclusionProof, inclusion_proof, verify_inclusion
@@ -42,6 +44,7 @@ except _PackageNotFoundError:  # running from a source tree, not installed
     __version__ = "0.0.0.dev0"
 
 __all__ = [
+    "WARNING_ANCHOR_CHECK_DISABLED",
     "AdmissionPolicy",
     "AdmissionResult",
     "InclusionProof",
@@ -50,6 +53,7 @@ __all__ = [
     "build_reputation_credential",
     "did_from_private_key",
     "inclusion_proof",
+    "parse_rfc3339_instant",
     "subject_severed_score",
     "verify_credential_proof",
     "verify_inclusion",

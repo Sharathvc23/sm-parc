@@ -8,7 +8,9 @@ End to end:
      ReputationCredential (a W3C VC) over it;
   3. a *different* chapter admits the agent by verifying the issuer signature and
      recomputing the corroborated 0.2 score itself — never trusting the issuer's
-     server.
+     server. The gate binds the credential to the agent PRESENTING it
+     (``presenter_did`` — the did the chapter authenticated for the connecting
+     agent), so a copied credential + ledger cannot be replayed by someone else.
 
 Then the same demo shows the gate rejecting an un-corroborated (wash-trading)
 agent whose 0.2 score is severed to zero.
@@ -89,6 +91,7 @@ def main() -> None:
     res = admit(
         honest["vc"],
         policy=policy,
+        presenter_did=AGENT_DID,  # the did the chapter authenticated for the visitor
         ledger=honest["ledger"],
         is_valid=always_valid,
         now="2026-06-08T00:00:00Z",
@@ -98,7 +101,11 @@ def main() -> None:
     print("honest agent     : score", honest["ledger"]["reputation_score"], end=" ")
     print("corroboration", honest["ledger"]["corroboration_rate"])
     print("  -> admission   :", res.stage, "(ok)" if res.ok else "(REJECTED)")
+    print("  -> warnings    :", res.warnings or "none")
     assert res.ok and res.stage == "admitted"
+    # This demo sets no required_anchors, so the gate says so: a production policy
+    # MUST name anchors, or three fresh dids can forge a recompute-clean credential.
+    assert res.warnings == ["anchor_check_disabled"]
 
     # A wash-trading agent issues the same receipts with NO distinct corroboration.
     # nanda-rep/0.2 severs the un-corroborated score to 0, so it fails the gate.
@@ -106,6 +113,7 @@ def main() -> None:
     res = admit(
         wash["vc"],
         policy=policy,
+        presenter_did=AGENT_DID,
         ledger=wash["ledger"],
         is_valid=always_valid,
         now="2026-06-08T00:00:00Z",

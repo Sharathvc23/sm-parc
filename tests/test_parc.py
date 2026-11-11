@@ -18,11 +18,12 @@ from sm_arp.vrp import build_ledger, cosign_receipt, did_from_sk
 
 from sm_parc import (
     AdmissionPolicy,
-    admit,
+    AdmissionResult,
     build_reputation_credential,
     did_from_private_key,
     verify_credential_proof,
 )
+from sm_parc import admit as _gate
 
 CHAPTER_SK = hashlib.sha256(b"parc-issuer-chapter").digest()
 CHAPTER_DID = did_from_private_key(CHAPTER_SK)
@@ -31,10 +32,22 @@ SUBJECT_DID = did_from_sk(SUBJECT_SK)
 COUNTERPARTY_SK = hashlib.sha256(b"parc-counterparty").digest()
 COUNTERPARTY_DID = did_from_sk(COUNTERPARTY_SK)
 VALID_FROM, VALID_UNTIL = "2026-06-07T00:00:00Z", "2026-07-07T00:00:00Z"
+# A fixed clock inside the window. The gate defaults to the REAL wall clock (so the
+# fixtures above would be stale by the time you read this); every test injects NOW
+# unless it is testing the clock itself.
+NOW = "2026-06-08T00:00:00Z"
 
 
 def _always(_r: dict[str, Any]) -> bool:
     return True
+
+
+def admit(vc: dict[str, Any], **kw: Any) -> AdmissionResult:
+    """The gate with this suite's defaults: the subject presents its own credential at
+    the fixed in-window clock. Tests override either to exercise the checks."""
+    kw.setdefault("presenter_did", SUBJECT_DID)
+    kw.setdefault("now", NOW)
+    return _gate(vc, **kw)
 
 
 def _receipt(n: int, *, corroborated: bool = True, category: str = "purchase") -> dict[str, Any]:
@@ -135,6 +148,7 @@ def test_admit_corroborated_agent() -> None:
     vc = _vc(ledger=ledger)
     res = admit(vc, policy=_policy(), ledger=ledger, is_valid=_always, now="2026-06-08T00:00:00Z")
     assert res.ok and res.stage == "admitted"
+    assert res.warnings == ["anchor_check_disabled"]  # no anchors configured — said out loud
 
 
 def test_v01_facet_rejected_at_gate() -> None:
@@ -385,3 +399,278 @@ def test_involves_anchor_rejects_invalid_receipt() -> None:
 
     junk = _cp_receipt(5, ANCHOR_DID, ANCHOR_SK)
     assert _involves_anchor([junk], {ANCHOR_DID}, is_valid=lambda _r: False) is False
+
+
+# ── audit 2026-11: clock, presenter, subject-bound ledger, id, cap, malformed ──
+
+OTHER_SK = hashlib.sha256(b"parc-other-agent").digest()
+OTHER_DID = did_from_sk(OTHER_SK)
+
+
+def _strip_and_resign(vc: dict[str, Any], **changes: Any) -> dict[str, Any]:
+    """Apply top-level ``changes`` (``None`` deletes the key) and re-sign as the
+    issuer, so the proof verifies and the envelope check under test is what fires."""
+    for key, value in changes.items():
+        if value is None:
+            vc.pop(key, None)
+        else:
+            vc[key] = value
+    return _resign(vc, CHAPTER_SK)
+
+
+# 1. expiry is enforced against the real clock, as instants ------------------
+
+
+def test_default_clock_rejects_expired_credential() -> None:
+    """``now`` omitted → the UTC wall clock. The fixture window (June to July 2026) is
+    in the past, so the credential is stale WITHOUT any caller cooperation."""
+    ledger = _ledger()
+    vc = _vc(ledger=ledger)
+    res = _gate(vc, policy=_policy(), presenter_did=SUBJECT_DID, ledger=ledger, is_valid=_always)
+    assert not res.ok and res.stage == "stale"
+
+
+def test_window_compared_as_instants_not_strings() -> None:
+    """validUntil is 2026-07-07T00:00:00Z. A ``now`` of 20:00 on the 6th at UTC-5 is
+    01:00Z on the 7th — AFTER expiry — yet sorts lexically BEFORE the bound. The
+    string comparison admitted it; instant comparison rejects it."""
+    ledger = _ledger()
+    vc = _vc(ledger=ledger)
+    assert VALID_UNTIL > "2026-07-06T20:00:00-05:00"  # the lexical trap
+    res = admit(
+        vc, policy=_policy(), ledger=ledger, is_valid=_always, now="2026-07-06T20:00:00-05:00"
+    )
+    assert not res.ok and res.stage == "stale"
+    # ...and an offset instant INSIDE the window is admitted: 04:00+05:00 = 23:00Z on the 6th.
+    res = admit(
+        vc, policy=_policy(), ledger=ledger, is_valid=_always, now="2026-07-07T04:00:00+05:00"
+    )
+    assert res.ok, (res.stage, res.detail)
+
+
+def test_aware_datetime_now_is_accepted() -> None:
+    from datetime import UTC, datetime
+
+    ledger = _ledger()
+    vc = _vc(ledger=ledger)
+    res = admit(
+        vc,
+        policy=_policy(),
+        ledger=ledger,
+        is_valid=_always,
+        now=datetime(2026, 6, 8, tzinfo=UTC),
+    )
+    assert res.ok
+
+
+def test_naive_or_unparseable_now_is_malformed() -> None:
+    from datetime import datetime
+
+    ledger = _ledger()
+    vc = _vc(ledger=ledger)
+    for bad_now in ("2026-06-08T00:00:00", "2026-06-08", "tomorrow", datetime(2026, 6, 8)):
+        res = admit(vc, policy=_policy(), ledger=ledger, is_valid=_always, now=bad_now)
+        assert not res.ok and res.stage == "malformed", (bad_now, res)
+
+
+def test_naive_or_missing_window_bounds_are_malformed() -> None:
+    """A credential whose bounds are offset-less, or absent, names no instant and is
+    refused — not silently treated as unbounded (the pre-0.3 behaviour)."""
+    ledger = _ledger()
+    cases: list[dict[str, Any]] = [
+        {"validFrom": "2026-06-07T00:00:00"},  # naive
+        {"validUntil": "2026-07-07"},  # date only
+        {"validUntil": None},  # missing → unbounded, refused
+        {"validFrom": None},
+        {"validUntil": 1783468800},  # epoch int
+    ]
+    for changes in cases:
+        vc = _strip_and_resign(_vc(ledger=ledger), **changes)
+        assert verify_credential_proof(vc)
+        res = admit(vc, policy=_policy(), ledger=ledger, is_valid=_always)
+        assert not res.ok and res.stage == "malformed", (changes, res)
+
+
+def test_builder_refuses_window_that_names_no_instant() -> None:
+    import pytest
+
+    ledger = _ledger()
+    with pytest.raises(ValueError):
+        _vc(ledger=ledger, valid_from="2026-06-07T00:00:00")  # naive
+    with pytest.raises(ValueError):
+        _vc(ledger=ledger, valid_until="2026-07-07")  # date only
+    with pytest.raises(ValueError):
+        _vc(ledger=ledger, valid_from=VALID_UNTIL, valid_until=VALID_FROM)  # inverted
+
+
+# 2. presenter binding ---------------------------------------------------------
+
+
+def test_presenter_mismatch_rejected() -> None:
+    """A copied credential + ledger is public bytes; only its subject is admitted on it."""
+    ledger = _ledger()
+    vc = _vc(ledger=ledger)
+    res = admit(vc, policy=_policy(), ledger=ledger, is_valid=_always, presenter_did=OTHER_DID)
+    assert not res.ok and res.stage == "presenter_mismatch"
+    assert SUBJECT_DID in res.detail and OTHER_DID in res.detail
+
+
+def test_subject_without_id_is_malformed() -> None:
+    ledger = _ledger()
+    vc = _vc(ledger=ledger)
+    del vc["credentialSubject"]["id"]
+    _resign(vc, CHAPTER_SK)
+    res = admit(vc, policy=_policy(), ledger=ledger, is_valid=_always)
+    assert not res.ok and res.stage == "malformed"
+
+
+# 3. inline ledger must be the subject's OWN history ---------------------------
+
+
+def _foreign_receipt(n: int) -> dict[str, Any]:
+    """A fully corroborated receipt issued by ANOTHER agent (OTHER_DID)."""
+    r = _receipt(n)
+    r["issuer_did"] = r["principal_did"] = OTHER_DID
+    r["evidence"] = {"witness_signatures": [cosign_receipt(r, signing_key_bytes=COUNTERPARTY_SK)]}
+    return r
+
+
+def test_ledger_of_another_agent_rejected() -> None:
+    """The issuer honestly signs over Y's receipts labelled with X's subject. The root,
+    count and scores all recompute — and X would have been admitted on Y's history.
+    Every inline receipt MUST be issued by the subject."""
+    foreign = [_foreign_receipt(i) for i in range(3)]
+    ledger = build_ledger(
+        subject=SUBJECT_DID,
+        receipts=foreign,
+        is_valid=_always,
+        as_of="2026-06-07T00:00:00Z",
+        method="nanda-rep/0.2",
+    )
+    assert ledger["reputation_score"] > 0
+    vc = _vc(ledger=ledger)
+    res = admit(vc, policy=_policy(min_reputation_score=1.0), ledger=ledger, is_valid=_always)
+    assert not res.ok and res.stage == "ledger_subject_mismatch"
+    assert OTHER_DID in res.detail
+
+
+def test_single_foreign_receipt_among_own_rejected() -> None:
+    receipts = [_receipt(i) for i in range(3)] + [_foreign_receipt(3)]
+    ledger = build_ledger(
+        subject=SUBJECT_DID,
+        receipts=receipts,
+        is_valid=_always,
+        as_of="2026-06-07T00:00:00Z",
+        method="nanda-rep/0.2",
+    )
+    vc = _vc(ledger=ledger)
+    res = admit(vc, policy=_policy(), ledger=ledger, is_valid=_always)
+    assert not res.ok and res.stage == "ledger_subject_mismatch"
+    assert "1 receipt(s)" in res.detail
+
+
+# 4. a credential always has an id, and the gate requires one ------------------
+
+
+def test_builder_always_emits_an_id() -> None:
+    vc = _vc()  # no credential_id supplied
+    assert isinstance(vc["id"], str) and vc["id"].startswith("urn:uuid:")
+    assert vc["id"] != _vc()["id"]  # fresh per mint
+    assert verify_credential_proof(vc)  # the id is under the signature
+    assert _vc(credential_id="urn:uuid:given")["id"] == "urn:uuid:given"
+
+
+def test_builder_refuses_empty_id() -> None:
+    import pytest
+
+    with pytest.raises(ValueError):
+        _vc(credential_id="")
+
+
+def test_credential_without_id_rejected_as_unrevocable() -> None:
+    """A verifier keys revocation on vc.id; an id-less credential could never be
+    revoked, so it is refused outright (before the revocation lookup)."""
+    ledger = _ledger()
+    for bad_id in (None, "", 42):
+        vc = _strip_and_resign(_vc(ledger=ledger), id=bad_id)
+        if bad_id is None:
+            assert "id" not in vc
+        assert verify_credential_proof(vc)
+        res = admit(vc, policy=_policy(), ledger=ledger, is_valid=_always)
+        assert not res.ok and res.stage == "missing_id", (bad_id, res)
+
+
+# 5. execution budget applies inline too ---------------------------------------
+
+
+def test_inline_ledger_over_cap_rejected_before_recomputation() -> None:
+    ledger = _ledger(3)
+    vc = _vc(ledger=ledger)
+    calls = 0
+
+    def counting_is_valid(r: dict[str, Any]) -> bool:
+        nonlocal calls
+        calls += 1
+        return True
+
+    res = admit(
+        vc, policy=_policy(max_ledger_receipts=2), ledger=ledger, is_valid=counting_is_valid
+    )
+    assert not res.ok and res.stage == "ledger_too_large"
+    assert "3 receipts > max 2" in res.detail
+    assert calls == 0  # nothing was recomputed
+    # at the cap exactly is fine
+    res = admit(vc, policy=_policy(max_ledger_receipts=3), ledger=ledger, is_valid=_always)
+    assert res.ok
+
+
+# 6. the disabled sybil defence is announced -----------------------------------
+
+
+def test_anchor_warning_present_iff_no_anchors_configured() -> None:
+    from sm_parc import WARNING_ANCHOR_CHECK_DISABLED
+
+    ledger = _anchor_ledger([_cp_receipt(i, ANCHOR_DID, ANCHOR_SK) for i in range(3)])
+    vc = _vc(ledger=ledger)
+    loud = admit(vc, policy=_policy(), ledger=ledger, is_valid=_always)
+    assert loud.ok and loud.warnings == [WARNING_ANCHOR_CHECK_DISABLED]
+    quiet = admit(
+        vc, policy=_policy(required_anchors={ANCHOR_DID}), ledger=ledger, is_valid=_always
+    )
+    assert quiet.ok and quiet.warnings == []
+    # rejections carry the warning too — the operator sees it regardless of outcome
+    rejected = admit(vc, policy=_policy(), ledger=ledger, is_valid=_always, presenter_did=OTHER_DID)
+    assert not rejected.ok and rejected.warnings == [WARNING_ANCHOR_CHECK_DISABLED]
+
+
+# 8. a non-numeric facet is malformed, not a crash -----------------------------
+
+
+def test_non_numeric_scores_are_malformed() -> None:
+    """``float("15.0")`` would silently coerce and ``float(None)`` / ``float([..])``
+    would raise out of the gate; a bool is an int in Python. All are refused."""
+    ledger = _ledger()
+    for key in ("reputation_score", "validity_rate", "corroboration_rate"):
+        for bad in ("15.0", None, True, [15.0], {"value": 15.0}):
+            vc = _vc(ledger=ledger)
+            vc["credentialSubject"][key] = bad
+            _resign(vc, CHAPTER_SK)
+            res = admit(vc, policy=_policy(), ledger=ledger, is_valid=_always)
+            assert not res.ok and res.stage == "malformed", (key, bad, res)
+
+
+def test_non_finite_scores_cannot_pass() -> None:
+    """NaN is the dangerous one: ``abs(nan - x) > tol`` and ``nan < min`` are both
+    False, so a NaN facet would sail through recompute AND threshold. JCS (RFC 8785)
+    has no encoding for NaN/Infinity, so such a credential cannot carry a verifying
+    proof — the gate rejects it (signature) without raising. The explicit finite
+    check in the envelope is defence in depth behind that."""
+    from sm_parc.admission import _is_finite_number
+
+    ledger = _ledger()
+    for bad in (float("nan"), float("inf"), -float("inf")):
+        assert not _is_finite_number(bad)
+        vc = _vc(ledger=ledger)
+        vc["credentialSubject"]["reputation_score"] = bad
+        res = admit(vc, policy=_policy(), ledger=ledger, is_valid=_always)
+        assert not res.ok and res.stage == "signature", (bad, res)
