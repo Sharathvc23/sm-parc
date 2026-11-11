@@ -16,8 +16,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      # sm-arp (incl. sm_arp.vrp) is a normal PyPI dependency — pip install -e
-      # pulls it from PyPI alongside sm-parc's other deps.
+      # sm-arp (incl. sm_arp.vrp) is a normal PyPI dependency. sm-parc 0.3.0 needs
+      # sm-arp>=0.4.0 (canonical bytes exclude evidence.witness_signatures, which the
+      # real-verifier suite relies on) and PyPI currently ships 0.3.4, so install the
+      # merged 0.4.0 commit from GitHub first; `pip install -e` then sees the pin
+      # satisfied. TODO: drop this step once sm-arp 0.4.0 is on PyPI.
+      - run: pip install "git+https://github.com/Sharathvc23/sm-arp@f182c0c07556147d57548945f1a3b00088138aad"
       - run: pip install -e ".[dev]"
       - run: ruff check .
       - run: ruff format --check .
