@@ -43,16 +43,28 @@ def test_honest_visitor_admitted() -> None:
     presented = _present(
         subject_did=HONEST_DID, receipts=honest_receipts(), cred_id="urn:uuid:parc-honest"
     )
-    result = city_b_admits(presented)
+    result = city_b_admits(presented, presenter_did=HONEST_DID)
     assert result.ok
     assert result.stage == "admitted"
+
+
+def test_honest_artifact_replayed_by_another_agent_is_refused() -> None:
+    """The artifact is public bytes. Whoever City B authenticates as the presenter
+    must BE the credential's subject — the wash agent cannot borrow the honest
+    visitor's passport."""
+    presented = _present(
+        subject_did=HONEST_DID, receipts=honest_receipts(), cred_id="urn:uuid:parc-honest"
+    )
+    result = city_b_admits(presented, presenter_did=WASH_DID)
+    assert not result.ok
+    assert result.stage == "presenter_mismatch"
 
 
 def test_wash_visitor_rejected_below_threshold() -> None:
     presented = _present(
         subject_did=WASH_DID, receipts=wash_receipts(), cred_id="urn:uuid:parc-wash"
     )
-    result = city_b_admits(presented)
+    result = city_b_admits(presented, presenter_did=WASH_DID)
     assert not result.ok
     assert result.stage == "below_threshold"
 
@@ -68,12 +80,12 @@ def test_city_b_decides_from_presented_artifact_only() -> None:
     presented = _present(
         subject_did=HONEST_DID, receipts=honest_receipts(), cred_id="urn:uuid:parc-honest"
     )
-    first = city_b_admits(presented)
+    first = city_b_admits(presented, presenter_did=HONEST_DID)
 
     # A second, independent wire copy (what a different verifier would receive) —
     # no shared mutable object, no City A handle.
     rewired = json.dumps(json.loads(presented), sort_keys=True)
-    second = city_b_admits(rewired)
+    second = city_b_admits(rewired, presenter_did=HONEST_DID)
 
     assert (first.ok, first.stage) == (second.ok, second.stage)
     # And the artifact B saw really is credential + inline receipts, nothing more.
@@ -94,7 +106,7 @@ def test_wash_tampering_with_receipts_fails_recompute() -> None:
     # The wash agent swaps in different receipts after A signed — recompute breaks.
     artifact["ledger"]["receipts"] = wash_receipts()
     tampered = json.dumps(artifact, sort_keys=True)
-    result = city_b_admits(tampered)
+    result = city_b_admits(tampered, presenter_did=WASH_DID)
     assert not result.ok
     assert result.stage in {"root_mismatch", "count_mismatch", "score_mismatch"}
 
@@ -104,8 +116,8 @@ def test_naive_0_1_gate_would_admit_wash() -> None:
     presented = _present(
         subject_did=WASH_DID, receipts=wash_receipts(), cred_id="urn:uuid:parc-wash"
     )
-    naive = demonstrate_naive_gate_would_admit(presented)
-    real = city_b_admits(presented)
+    naive = demonstrate_naive_gate_would_admit(presented, presenter_did=WASH_DID)
+    real = city_b_admits(presented, presenter_did=WASH_DID)
 
     assert naive.ok and naive.stage == "admitted"
     assert not real.ok and real.stage == "below_threshold"

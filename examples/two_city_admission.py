@@ -174,7 +174,7 @@ def city_a_issues(
     return {"vc": vc, "ledger": ledger}
 
 
-def city_b_admits(presented_artifact_json: str) -> AdmissionResult:
+def city_b_admits(presented_artifact_json: str, *, presenter_did: str) -> AdmissionResult:
     """City B: decide admission from the agent's PRESENTED artifact only.
 
     ``presented_artifact_json`` is a JSON string the agent hands over — City B has
@@ -182,6 +182,11 @@ def city_b_admits(presented_artifact_json: str) -> AdmissionResult:
     reference to any of City A's in-memory objects; it can only read what was on the
     wire. Recomputation runs over the inline receipts the agent presented; the signed
     ``behavioral_merkle_root`` + ``receipt_count`` pin them, so tampering fails.
+
+    ``presenter_did`` is the did City B AUTHENTICATED for the connecting agent (in a
+    real chapter: the key that signed the admission request). It is deliberately a
+    separate input, never read out of the artifact — the gate admits a credential
+    only for its own subject, so a copied artifact cannot be replayed by another did.
     """
     artifact = json.loads(presented_artifact_json)
     policy = AdmissionPolicy(
@@ -193,13 +198,16 @@ def city_b_admits(presented_artifact_json: str) -> AdmissionResult:
     return admit(
         artifact["vc"],
         policy=policy,
+        presenter_did=presenter_did,
         ledger=artifact["ledger"],
         is_valid=always_valid,
         now=NOW,
     )
 
 
-def demonstrate_naive_gate_would_admit(presented_artifact_json: str) -> AdmissionResult:
+def demonstrate_naive_gate_would_admit(
+    presented_artifact_json: str, *, presenter_did: str
+) -> AdmissionResult:
     """The load-bearing contrast: a NAIVE City B admitting on nanda-rep/0.1.
 
     A naive verifier trusts the un-corroborated 0.1 score and (like every chapter
@@ -232,7 +240,7 @@ def demonstrate_naive_gate_would_admit(presented_artifact_json: str) -> Admissio
         min_reputation_score=MIN_SCORE,
         require_recomputation=False,  # the naive chapter does not recompute
     )
-    return admit(naive_vc, policy=naive_policy, now=NOW)
+    return admit(naive_vc, policy=naive_policy, presenter_did=presenter_did, now=NOW)
 
 
 def _score_01(receipts: list[dict[str, Any]]) -> float:
@@ -257,7 +265,7 @@ def build_fixture() -> dict[str, Any]:
     for persona, subject_did, receipts, cred_id, corroborated in visitors:
         artifact = city_a_issues(subject_did=subject_did, receipts=receipts, cred_id=cred_id)
         presented = json.dumps(artifact, sort_keys=True)
-        result = city_b_admits(presented)
+        result = city_b_admits(presented, presenter_did=subject_did)
 
         subj = artifact["vc"]["credentialSubject"]
         score_02 = float(subj["reputation_score"])
@@ -350,7 +358,7 @@ def main() -> None:
         artifact = city_a_issues(subject_did=subject_did, receipts=receipts, cred_id=cred_id)
         # Serialize, sever the in-memory link, and present to City B.
         presented = json.dumps(artifact, sort_keys=True)
-        result = city_b_admits(presented)
+        result = city_b_admits(presented, presenter_did=subject_did)
 
         subj = artifact["vc"]["credentialSubject"]
         score_02 = float(subj["reputation_score"])
@@ -369,8 +377,8 @@ def main() -> None:
     )
     wash_presented = json.dumps(wash_artifact, sort_keys=True)
 
-    real = city_b_admits(wash_presented)
-    naive = demonstrate_naive_gate_would_admit(wash_presented)
+    real = city_b_admits(wash_presented, presenter_did=WASH_DID)
+    naive = demonstrate_naive_gate_would_admit(wash_presented, presenter_did=WASH_DID)
     naive_decision = "ADMIT" if naive.ok else "REJECT"
     real_decision = "ADMIT" if real.ok else "REJECT"
     print("load-bearing contrast for wash-visitor (same receipts, same threshold):")
@@ -384,7 +392,9 @@ def main() -> None:
     honest_artifact = city_a_issues(
         subject_did=HONEST_DID, receipts=honest_receipts(), cred_id="urn:uuid:parc-honest"
     )
-    honest_res = city_b_admits(json.dumps(honest_artifact, sort_keys=True))
+    honest_res = city_b_admits(
+        json.dumps(honest_artifact, sort_keys=True), presenter_did=HONEST_DID
+    )
     assert honest_res.ok and honest_res.stage == "admitted", "honest must be admitted"
 
     print()

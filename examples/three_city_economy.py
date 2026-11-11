@@ -169,20 +169,35 @@ def home_issues(
     return {"vc": vc, "ledger": ledger}
 
 
-def admit_full(*, bar: float, vc: dict[str, Any], ledger: dict[str, Any]) -> AdmissionResult:
+def admit_full(
+    *, bar: float, vc: dict[str, Any], ledger: dict[str, Any], presenter_did: str
+) -> AdmissionResult:
     """An early-stage gate (community, marketplace): the small ledger is presented in
-    full and the gate recomputes it."""
+    full and the gate recomputes it. ``presenter_did`` is the did the venue
+    authenticated for the arriving agent."""
     policy = AdmissionPolicy(
         trusted_issuers={CITY_A_DID},
         required_scoring_method=SCORING_METHOD_V2,
         min_reputation_score=bar,
         require_recomputation=True,
     )
-    return admit(vc, policy=policy, ledger=ledger, is_valid=always_valid, now=NOW)
+    return admit(
+        vc,
+        policy=policy,
+        presenter_did=presenter_did,
+        ledger=ledger,
+        is_valid=always_valid,
+        now=NOW,
+    )
 
 
 def admit_with_disclosure(
-    *, bar: float, vc: dict[str, Any], revealed: list[dict[str, Any]], proofs: list[dict[str, Any]]
+    *,
+    bar: float,
+    vc: dict[str, Any],
+    revealed: list[dict[str, Any]],
+    proofs: list[dict[str, Any]],
+    presenter_did: str,
 ) -> tuple[AdmissionResult, bool]:
     """The enterprise gate: the 40-receipt ledger is NOT presented. The gate admits on
     the signed aggregate score (no recomputation) and spot-checks the revealed receipts
@@ -196,7 +211,7 @@ def admit_with_disclosure(
         min_reputation_score=bar,
         require_recomputation=False,  # selective disclosure: no full ledger handed over
     )
-    result = admit(vc, policy=policy, now=NOW)
+    result = admit(vc, policy=policy, presenter_did=presenter_did, now=NOW)
     root = vc["credentialSubject"]["behavioral_merkle_root"]
     disclosed_ok = all(verify_inclusion(r, p, root) for r, p in zip(revealed, proofs, strict=True))
     return result, disclosed_ok
@@ -225,7 +240,11 @@ def build_fixture() -> dict[str, Any]:
             revealed = [receipts[i] for i in REVEALED_INDICES]
             proofs = [inclusion_proof(receipts[:size], receipt=r) for r in revealed]
             result, disclosed_ok = admit_with_disclosure(
-                bar=float(city["bar"]), vc=artifact["vc"], revealed=revealed, proofs=proofs
+                bar=float(city["bar"]),
+                vc=artifact["vc"],
+                revealed=revealed,
+                proofs=proofs,
+                presenter_did=TRAVELER_DID,
             )
             disclosure = {
                 "presented_receipts": len(revealed),
@@ -249,7 +268,10 @@ def build_fixture() -> dict[str, Any]:
             }
         else:
             result = admit_full(
-                bar=float(city["bar"]), vc=artifact["vc"], ledger=artifact["ledger"]
+                bar=float(city["bar"]),
+                vc=artifact["vc"],
+                ledger=artifact["ledger"],
+                presenter_did=TRAVELER_DID,
             )
             disclosure = None
         journey.append(
@@ -271,13 +293,21 @@ def build_fixture() -> dict[str, Any]:
     cold = home_issues(
         subject_did=TRAVELER_DID, receipts=receipts[:PHASE_A], cred_id="urn:uuid:3city-cold"
     )
-    cold_result = admit_full(bar=float(CITIES["C"]["bar"]), vc=cold["vc"], ledger=cold["ledger"])
+    cold_result = admit_full(
+        bar=float(CITIES["C"]["bar"]),
+        vc=cold["vc"],
+        ledger=cold["ledger"],
+        presenter_did=TRAVELER_DID,
+    )
 
     # --- security: the wash-trader at the LOWEST bar ---------------------------
     wash = wash_receipts()
     wash_artifact = home_issues(subject_did=WASH_DID, receipts=wash, cred_id="urn:uuid:3city-wash")
     wash_result = admit_full(
-        bar=float(CITIES["A"]["bar"]), vc=wash_artifact["vc"], ledger=wash_artifact["ledger"]
+        bar=float(CITIES["A"]["bar"]),
+        vc=wash_artifact["vc"],
+        ledger=wash_artifact["ledger"],
+        presenter_did=WASH_DID,
     )
 
     return {

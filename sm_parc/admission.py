@@ -7,33 +7,41 @@ recomputation of the ledger:
 
   1. the VC proof verifies under the issuer did;
   2. the issuer is trusted by policy (a chapter OR a credentialed auditor);
-  3. the credential is not revoked and is inside its validity window
-     (``validFrom`` ≤ now ≤ ``validUntil``);
-  4. the credential's ``scoring_method`` is the corroborated, collusion-resistant
+  3. the credential carries an ``id`` (so it CAN be revoked), is not revoked, and is
+     inside its validity window (``validFrom`` ≤ now ≤ ``validUntil``, compared as
+     instants against the real clock unless the caller injects ``now``);
+  4. the credential is bound to the agent presenting it
+     (``credentialSubject.id == presenter_did``) — a public credential + ledger
+     cannot be replayed by a third party;
+  5. the credential's ``scoring_method`` is the corroborated, collusion-resistant
      ``nanda-rep/0.2`` — a credential carrying the un-corroborated ``nanda-rep/0.1``
      score is rejected (``scoring_method_unsupported``);
-  5. the presented ledger is recomputable and its receipt count matches the
-     credential's signed ``receipt_count`` (no withholding);
-  6. the ledger recomputes to the VC's ``behavioral_merkle_root`` and the
+  6. the presented ledger is within the execution budget, recomputable, its receipt
+     count matches the credential's signed ``receipt_count`` (no withholding), and
+     every receipt was issued BY the subject (inline mode — a ledger earned by
+     another agent cannot be attached to this subject's credential);
+  7. the ledger recomputes to the VC's ``behavioral_merkle_root`` and the
      ``nanda-rep/0.2`` ``reputation_score`` / ``validity_rate`` / ``corroboration_rate``;
-  7. the scores clear the policy thresholds.
+  8. the scores clear the policy thresholds.
 
-Why bind admission to ``nanda-rep/0.2`` (step 4 + the v2 recompute in step 6): the
+Why bind admission to ``nanda-rep/0.2`` (step 5 + the v2 recompute in step 7): the
 0.2 score counts only receipts that are ARP-valid AND corroborated by a distinct
 counterparty AND not part of a severed collusion component. A wash-trading ring
 that mutually co-signs its own receipts is severed to a score of ~0, so its
 credential FAILS the gate at the threshold. The un-corroborated ``nanda-rep/0.1``
 score has no such defence, so the gate refuses to admit on it.
 
-Step 5-6 recomputation is ``sm_arp.vrp``. Pure: receipts' validity is supplied
-by the caller as ``is_valid`` (normally the ARP verifier), and ``now`` is supplied
-by the caller (no wall-clock here).
+Step 6-7 recomputation is ``sm_arp.vrp``. Receipts' validity is supplied by the
+caller as ``is_valid`` (normally the ARP verifier, ``sm_arp.verify_receipt``).
+``now`` defaults to the UTC wall clock and is injectable for tests.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from sm_arp.vrp import (
@@ -47,10 +55,20 @@ from sm_arp.vrp import (
     validity_rate,
 )
 
-from .credential import verify_credential_proof
+from .credential import parse_rfc3339_instant, verify_credential_proof
 
 IsValid = Callable[[dict[str, Any]], bool]
 Fetch = Callable[[str], dict[str, Any]]
+
+# The numeric facet fields the gate reads. Each MUST be a finite real number when
+# present: a non-numeric value used to raise ``TypeError``/``ValueError`` out of the
+# gate, and a NaN would pass BOTH the tolerance comparison (``abs(nan - x) > tol`` is
+# False) and the threshold (``nan < min`` is False) — i.e. be admitted.
+_FACET_NUMBERS = ("reputation_score", "validity_rate", "corroboration_rate")
+
+# Structured policy warnings (``AdmissionResult.warnings``). They never change the
+# decision; they tell the operator which defence the policy has left switched off.
+WARNING_ANCHOR_CHECK_DISABLED = "anchor_check_disabled"
 
 
 @dataclass
@@ -73,35 +91,73 @@ class AdmissionPolicy:
     # co-signature — else the credential is rejected (anchor_absent). This is
     # the sybil defense: free-to-mint counterparty dids can corroborate their
     # own receipts, so a recomputable score alone proves arithmetic, not
-    # honesty. Empty set = check disabled. See THREATMODEL.md for the residual
-    # that remains (one real corroborated edge from an anchor still evades).
+    # honesty. Empty set = check DISABLED, and every result then carries the
+    # ``anchor_check_disabled`` warning: three fresh dids can forge a
+    # bar-clearing, recompute-clean credential. Production policies MUST set
+    # anchors. See THREATMODEL.md for the residual that remains even with them
+    # (one real corroborated edge from an anchor still evades).
     required_anchors: set[str] = field(default_factory=set)
-    # Deterministic execution budget: the gate runs SCC severance over the whole
-    # fetched ledger, so a hostile issuer could publish an enormous graph to exhaust
-    # the verifier. A fetched ledger with more than this many receipts is rejected
-    # (ledger_too_large) BEFORE the expensive recomputation. None = unbounded.
+    # Deterministic execution budget (both admission modes since 0.3.0): the gate
+    # hashes and severs the whole presented/fetched ledger, so a hostile presenter or
+    # issuer could hand over an enormous graph to exhaust the verifier. A ledger with
+    # more than this many receipts is rejected (ledger_too_large) BEFORE the
+    # expensive recomputation. None = unbounded.
     max_ledger_receipts: int | None = None
 
 
 @dataclass
 class AdmissionResult:
     ok: bool
-    # signature | untrusted_issuer | revoked | not_yet_valid | stale |
-    # scoring_method_unsupported | wrong_mode | ledger_too_large | count_mismatch |
-    # root_mismatch | anchor_absent | score_mismatch | below_threshold | admitted
+    # signature | untrusted_issuer | missing_id | revoked | malformed | not_yet_valid |
+    # stale | presenter_mismatch | scoring_method_unsupported | wrong_mode |
+    # ledger_too_large | count_mismatch | ledger_subject_mismatch | root_mismatch |
+    # anchor_absent | score_mismatch | below_threshold | admitted
     stage: str
     detail: str
+    # Policy warnings — defences the policy left disabled (see
+    # ``WARNING_ANCHOR_CHECK_DISABLED``). Informational: never changes ``ok``.
+    warnings: list[str] = field(default_factory=list)
 
     @classmethod
     def admitted(cls) -> AdmissionResult:
         return cls(True, "admitted", "credential verifies and clears policy")
 
 
+def _policy_warnings(policy: AdmissionPolicy) -> list[str]:
+    warnings: list[str] = []
+    if not policy.required_anchors:
+        warnings.append(WARNING_ANCHOR_CHECK_DISABLED)
+    return warnings
+
+
+def _resolve_now(now: str | datetime | None) -> datetime | None:
+    """The instant the gate evaluates the validity window at.
+
+    ``None`` → the UTC wall clock (production). A string is parsed as an RFC 3339
+    instant; a :class:`datetime` must be offset-aware. Returns ``None`` when the
+    injected value does not name an instant (the caller then gets ``malformed``).
+    """
+    if now is None:
+        return datetime.now(UTC)
+    if isinstance(now, datetime):
+        return now if now.utcoffset() is not None else None
+    return parse_rfc3339_instant(now)
+
+
+def _is_finite_number(value: object) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+
+
 def _check_envelope(
-    vc: dict[str, Any], *, policy: AdmissionPolicy, now: str | None
+    vc: dict[str, Any],
+    *,
+    policy: AdmissionPolicy,
+    presenter_did: str,
+    now: str | datetime | None,
 ) -> AdmissionResult | None:
     """Shared envelope checks for both admission modes: proof, trusted issuer,
-    revocation, validity window, and the required scoring method.
+    mandatory id + revocation, validity window (as instants), presenter binding,
+    facet well-formedness, and the required scoring method.
 
     Returns the failing :class:`AdmissionResult`, or ``None`` if the envelope is
     sound (in which case the caller proceeds to its mode-specific recomputation).
@@ -115,26 +171,71 @@ def _check_envelope(
             False, "untrusted_issuer", f"issuer {issuer} not in policy.trusted_issuers"
         )
 
+    # Revocation is keyed on vc.id. A credential without one can never be revoked, so
+    # the gate refuses it outright rather than admitting an unrevocable credential.
     cred_id = vc.get("id")
-    if cred_id is not None and cred_id in policy.revocation:
+    if not isinstance(cred_id, str) or not cred_id:
+        return AdmissionResult(False, "missing_id", "credential has no id; it cannot be revoked")
+    if cred_id in policy.revocation:
         return AdmissionResult(False, "revoked", f"credential {cred_id} is revoked")
 
-    # Not-yet-valid: a credential's window has a lower bound too.
-    valid_from = vc.get("validFrom")
-    if now is not None and isinstance(valid_from, str) and now < valid_from:
+    # Validity window — compared as INSTANTS, never as strings. Both bounds are
+    # required: a credential with no window is unbounded, and an offset other than
+    # "Z" would defeat a lexical comparison. ``now`` defaults to the wall clock.
+    instant = _resolve_now(now)
+    if instant is None:
+        return AdmissionResult(False, "malformed", f"now {now!r} is not an RFC 3339 instant")
+    valid_from = parse_rfc3339_instant(vc.get("validFrom"))
+    if valid_from is None:
         return AdmissionResult(
-            False, "not_yet_valid", f"credential not valid until {valid_from} (now {now})"
+            False, "malformed", f"validFrom {vc.get('validFrom')!r} is not an RFC 3339 instant"
+        )
+    valid_until = parse_rfc3339_instant(vc.get("validUntil"))
+    if valid_until is None:
+        return AdmissionResult(
+            False, "malformed", f"validUntil {vc.get('validUntil')!r} is not an RFC 3339 instant"
+        )
+    if instant < valid_from:
+        return AdmissionResult(
+            False,
+            "not_yet_valid",
+            f"credential not valid until {vc['validFrom']} (now {instant.isoformat()})",
+        )
+    if instant > valid_until:
+        return AdmissionResult(
+            False, "stale", f"credential expired at {vc['validUntil']} (now {instant.isoformat()})"
         )
 
-    valid_until = vc.get("validUntil")
-    if now is not None and isinstance(valid_until, str) and now > valid_until:
-        return AdmissionResult(False, "stale", f"credential expired at {valid_until} (now {now})")
+    subject = vc.get("credentialSubject")
+    if not isinstance(subject, dict):
+        return AdmissionResult(False, "malformed", "credentialSubject is not an object")
+    subject_did = subject.get("id")
+    if not isinstance(subject_did, str) or not subject_did:
+        return AdmissionResult(False, "malformed", "credentialSubject has no subject id")
+
+    # Presenter binding: the credential is for ONE agent, and only that agent may be
+    # admitted on it. Without this, anyone holding a (public) credential + ledger
+    # could replay it. ``presenter_did`` is the did the verifier has AUTHENTICATED
+    # for the connecting agent — never read from the credential or the ledger.
+    if subject_did != presenter_did:
+        return AdmissionResult(
+            False,
+            "presenter_mismatch",
+            f"credential subject {subject_did} is not the presenter {presenter_did}",
+        )
+
+    for key in _FACET_NUMBERS:
+        if key in subject and not _is_finite_number(subject[key]):
+            return AdmissionResult(
+                False,
+                "malformed",
+                f"credentialSubject.{key} {subject[key]!r} is not a finite number",
+            )
 
     # The credential MUST carry the corroborated, collusion-resistant scoring method.
     # A credential whose facet is the un-corroborated nanda-rep/0.1 score is rejected
     # here: that score lets a wash-trading ring inflate itself, so the gate refuses to
     # admit on it (corroboration_required).
-    subject = vc.get("credentialSubject") or {}
     scoring_method = subject.get("scoring_method")
     if scoring_method != policy.required_scoring_method:
         return AdmissionResult(
@@ -179,13 +280,19 @@ def subject_severed_score(
     )
 
 
+def _with_warnings(result: AdmissionResult, policy: AdmissionPolicy) -> AdmissionResult:
+    result.warnings = _policy_warnings(policy)
+    return result
+
+
 def admit(
     vc: dict[str, Any],
     *,
     policy: AdmissionPolicy,
+    presenter_did: str,
     ledger: dict[str, Any] | None = None,
     is_valid: IsValid | None = None,
-    now: str | None = None,
+    now: str | datetime | None = None,
 ) -> AdmissionResult:
     """Decide admission for ``vc`` under ``policy`` (INLINE, self-contained mode).
 
@@ -195,19 +302,52 @@ def admit(
     mode catches *self-dealing* (the corroboration filter) but structurally CANNOT see
     an N-party Sybil ring. For that, see :func:`admit_over_published_ledger`.
 
+    ``presenter_did`` (required) is the did the verifier has authenticated for the
+    agent presenting the credential — e.g. the key that signed the admission request.
+    The credential is admitted only for its own subject (``presenter_mismatch``).
+
     ``ledger`` (the agent's presented Receipts Ledger) + ``is_valid`` are required
     when ``policy.require_recomputation`` is True (the default and recommended
-    posture). ``now`` (RFC 3339) enables the validity-window checks against both
-    ``validFrom`` and ``validUntil``. Under recomputation the credential's signed
-    ``receipt_count`` must also match the presented ledger (anti-withholding), and
-    the recomputed nanda-rep/0.2 ``reputation_score`` / ``validity_rate`` /
-    ``corroboration_rate`` must match the signed facet.
+    posture). ``now`` defaults to the UTC wall clock; inject an RFC 3339 string or an
+    offset-aware :class:`datetime` for deterministic tests. The window is checked
+    against both ``validFrom`` and ``validUntil`` as instants. Under recomputation the
+    presented ledger must be within ``policy.max_ledger_receipts``, its signed
+    ``receipt_count`` must match (anti-withholding), every receipt must have been
+    issued by the subject (``ledger_subject_mismatch``), and the recomputed
+    nanda-rep/0.2 ``reputation_score`` / ``validity_rate`` / ``corroboration_rate``
+    must match the signed facet.
+
+    Every result carries ``warnings`` naming the defences the policy left disabled —
+    notably ``anchor_check_disabled`` when ``required_anchors`` is empty.
     """
-    envelope = _check_envelope(vc, policy=policy, now=now)
+    return _with_warnings(
+        _admit_inline(
+            vc,
+            policy=policy,
+            presenter_did=presenter_did,
+            ledger=ledger,
+            is_valid=is_valid,
+            now=now,
+        ),
+        policy,
+    )
+
+
+def _admit_inline(
+    vc: dict[str, Any],
+    *,
+    policy: AdmissionPolicy,
+    presenter_did: str,
+    ledger: dict[str, Any] | None,
+    is_valid: IsValid | None,
+    now: str | datetime | None,
+) -> AdmissionResult:
+    envelope = _check_envelope(vc, policy=policy, presenter_did=presenter_did, now=now)
     if envelope is not None:
         return envelope
 
-    subject = vc.get("credentialSubject") or {}
+    subject: dict[str, Any] = vc["credentialSubject"]
+    subject_did: str = subject["id"]
 
     # Mode pairing: a pointer credential carries a ledger-wide score in
     # ``reputation_score`` and a ``ledger_uri``. Admitting it here would threshold the
@@ -225,11 +365,23 @@ def admit(
                 False, "root_mismatch", "recomputation required but ledger/is_valid not provided"
             )
         receipts = ledger.get("receipts")
-        if not isinstance(receipts, list) or any("action" not in r for r in receipts):
+        if not isinstance(receipts, list):
+            return AdmissionResult(
+                False, "root_mismatch", "presented ledger is not recomputable (no receipts)"
+            )
+        # 6a. Execution budget: reject an oversized ledger BEFORE any O(n) hashing or
+        # the recomputation, so a hostile presenter cannot exhaust the verifier.
+        if policy.max_ledger_receipts is not None and len(receipts) > policy.max_ledger_receipts:
+            return AdmissionResult(
+                False,
+                "ledger_too_large",
+                f"presented ledger has {len(receipts)} receipts > max {policy.max_ledger_receipts}",
+            )
+        if any("action" not in r for r in receipts):
             return AdmissionResult(
                 False, "root_mismatch", "presented ledger is not recomputable (refs-only)"
             )
-        # 6a. The credential's signed receipt_count MUST match the presented ledger —
+        # 6b. The credential's signed receipt_count MUST match the presented ledger —
         # a presenter cannot withhold receipts to change the recomputed scores.
         if subject.get("receipt_count") != len(receipts):
             return AdmissionResult(
@@ -237,11 +389,23 @@ def admit(
                 "count_mismatch",
                 f"count {subject.get('receipt_count')} != {len(receipts)} presented",
             )
+        # 6c. Subject binding: an inline ledger is the subject's OWN history, so every
+        # receipt MUST have been issued by the subject. Without this, a ledger earned
+        # by agent Y (and honestly signed over by the issuer) could be presented under
+        # agent X's credential — X would be admitted on Y's reputation.
+        foreign = [r.get("issuer_did") for r in receipts if r.get("issuer_did") != subject_did]
+        if foreign:
+            return AdmissionResult(
+                False,
+                "ledger_subject_mismatch",
+                f"{len(foreign)} receipt(s) not issued by subject {subject_did} "
+                f"(e.g. {foreign[0]!r})",
+            )
         if behavioral_merkle_root(receipts) != subject.get("behavioral_merkle_root"):
             return AdmissionResult(
                 False, "root_mismatch", "ledger does not recompute to the credential root"
             )
-        # 6a-bis. Anchor rule (sybil defense): dids are free to mint, so a
+        # 6d. Anchor rule (sybil defense): dids are free to mint, so a
         # recomputable corroborated score alone is forgeable — an attacker
         # co-signs its own receipts with fresh "counterparties". When the policy
         # names anchors, the subject's history must VERIFIABLY involve one
@@ -252,7 +416,7 @@ def admit(
             return AdmissionResult(
                 False, "anchor_absent", "no verified receipt involves a required anchor"
             )
-        # 6b. Recompute the nanda-rep/0.2 facet (corroborated + collusion-severed)
+        # 7. Recompute the nanda-rep/0.2 facet (corroborated + collusion-severed)
         # and confirm it matches the signed credentialSubject — a signed-but-inflated
         # score is caught here, and a SELF-DEALT receipt (self-cosigned, no distinct
         # counterparty) earns 0 via the corroboration filter. Note: this inline path
@@ -329,9 +493,10 @@ def admit_over_published_ledger(
     vc: dict[str, Any],
     *,
     policy: AdmissionPolicy,
+    presenter_did: str,
     fetch: Fetch,
     is_valid: IsValid,
-    now: str | None = None,
+    now: str | datetime | None = None,
 ) -> AdmissionResult:
     """Decide admission for ``vc`` in POINTER mode — the credential names a published
     community ledger (``credentialSubject.ledger_uri``) and the gate FETCHES it and
@@ -341,9 +506,11 @@ def admit_over_published_ledger(
     offline, this path trades that for collusion-resistance the inline mode cannot
     have. The facet describes the LEDGER (root + ledger-wide scores); the gate:
 
-      1. verifies the envelope (proof, trusted issuer, window, ``nanda-rep/0.2``);
+      1. verifies the envelope (proof, trusted issuer, id + revocation, window as
+         instants, presenter binding — ``presenter_did`` MUST equal
+         ``credentialSubject.id`` — and ``nanda-rep/0.2``);
       2. ``fetch``-es the full ledger named by ``ledger_uri`` (caller supplies the
-         resolver — no network here);
+         resolver — no network here) and bounds it by ``policy.max_ledger_receipts``;
       3. checks the fetched ledger hashes to the credential's SIGNED
          ``behavioral_merkle_root`` (tamper-evidence: the host cannot serve a
          different ledger than the one the issuer committed to);
@@ -354,6 +521,11 @@ def admit_over_published_ledger(
          N-party Sybil ring is severed to 0 HERE, by the gate — not trusted from an
          attested number.
 
+    A community ledger is MULTI-issuer by design (the anchor's and the ring's receipts
+    all live in it), so unlike inline mode there is no "every receipt issued by the
+    subject" rule here; subject binding is step 5 — only receipts the subject itself
+    issued are scored.
+
     Honest residual — the trust this does NOT remove: severance is only as good as
     the ledger's COMPLETENESS. A *colluding* issuer that publishes its ring WITHOUT
     the honest anchor (so the ring is the largest SCC and is never severed), or that
@@ -362,20 +534,38 @@ def admit_over_published_ledger(
     Pointer mode catches a LAZY-but-honest issuer; the colluding issuer is the notary
     / multi-issuer-attestation layer's problem. See ``THREATMODEL.md``.
     """
-    envelope = _check_envelope(vc, policy=policy, now=now)
+    return _with_warnings(
+        _admit_pointer(
+            vc, policy=policy, presenter_did=presenter_did, fetch=fetch, is_valid=is_valid, now=now
+        ),
+        policy,
+    )
+
+
+def _admit_pointer(
+    vc: dict[str, Any],
+    *,
+    policy: AdmissionPolicy,
+    presenter_did: str,
+    fetch: Fetch,
+    is_valid: IsValid,
+    now: str | datetime | None,
+) -> AdmissionResult:
+    envelope = _check_envelope(vc, policy=policy, presenter_did=presenter_did, now=now)
     if envelope is not None:
         return envelope
 
-    subject = vc.get("credentialSubject") or {}
+    subject: dict[str, Any] = vc["credentialSubject"]
+    subject_did: str = subject["id"]
     ledger_uri = subject.get("ledger_uri")
     if not isinstance(ledger_uri, str):
         return AdmissionResult(False, "wrong_mode", "inline credential (no ledger_uri); use admit")
 
     ledger = fetch(ledger_uri)
     receipts = ledger.get("receipts")
-    if not isinstance(receipts, list) or any("action" not in r for r in receipts):
+    if not isinstance(receipts, list):
         return AdmissionResult(
-            False, "root_mismatch", "fetched ledger is refs-only (not recomputable)"
+            False, "root_mismatch", "fetched ledger is not recomputable (no receipts)"
         )
 
     # 2a. Execution budget: reject an oversized ledger BEFORE any O(n) hashing or the
@@ -385,6 +575,10 @@ def admit_over_published_ledger(
             False,
             "ledger_too_large",
             f"fetched ledger has {len(receipts)} receipts > max {policy.max_ledger_receipts}",
+        )
+    if any("action" not in r for r in receipts):
+        return AdmissionResult(
+            False, "root_mismatch", "fetched ledger is refs-only (not recomputable)"
         )
 
     # 3. Tamper-evidence: the fetched ledger MUST hash to the credential's signed root.
@@ -403,7 +597,7 @@ def admit_over_published_ledger(
     # 4a. Curated-ledger stopgap: the fetched ledger MUST involve at least one
     # known-honest anchor, else it is treated as incomplete (defeats the trivial
     # "publish my ring with no honest anchor" laundering). Disabled when the policy
-    # carries no anchors.
+    # carries no anchors (and the result then says so: anchor_check_disabled).
     if policy.required_anchors and not _involves_anchor(
         receipts, policy.required_anchors, is_valid=is_valid
     ):
@@ -418,9 +612,6 @@ def admit_over_published_ledger(
 
     # 5. The gate DERIVES the subject's severed score over the full graph — an
     # isolated ring member lands at 0 here, computed by the gate, not attested.
-    subject_did = subject.get("id")
-    if not isinstance(subject_did, str):
-        return AdmissionResult(False, "root_mismatch", "credentialSubject has no subject id")
     severed = subject_severed_score(receipts, subject=subject_did, is_valid=is_valid)
     if severed < policy.min_reputation_score:
         return AdmissionResult(
@@ -433,6 +624,7 @@ def admit_over_published_ledger(
 
 
 __all__ = [
+    "WARNING_ANCHOR_CHECK_DISABLED",
     "AdmissionPolicy",
     "AdmissionResult",
     "admit",
