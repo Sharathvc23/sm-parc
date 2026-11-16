@@ -8,11 +8,24 @@ name: Publish to PyPI
 #     Workflow:     publish.yml
 #     Environment:  pypi
 # Then: bump the version in pyproject.toml, tag `vX.Y.Z`, and push the tag.
+#
+# Two ways to release:
+#   1. Push a tag like `v1.2.3` (the original path).
+#   2. Run it by hand: Actions -> this workflow -> Run workflow, or
+#      `gh workflow run <file> -f version=1.2.3`. The run refuses unless
+#      pyproject.toml on the chosen ref declares exactly that version and no tag
+#      for it exists yet; it publishes, then creates the matching `v<version>` tag.
 
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish. Must equal pyproject.toml on the selected ref, e.g. 0.2.0"
+        required: true
+        type: string
 
 jobs:
   build:
@@ -22,6 +35,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Check the requested version (manual runs only)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          WANT: ${{ inputs.version }}
+        run: |
+          if ! printf '%s' "$WANT" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.+-]*)?$'; then
+            echo "::error::'$WANT' is not a version"; exit 1
+          fi
+          have=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          if [ "$have" != "$WANT" ]; then
+            echo "::error::pyproject.toml on this ref declares $have, not $WANT; refusing to publish"; exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/v$WANT" >/dev/null; then
+            echo "::error::tag v$WANT already exists; release it by tag, not by hand"; exit 1
+          fi
       - run: pip install build twine
       - run: python -m build
       - run: python -m twine check dist/*
@@ -46,3 +74,24 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           skip-existing: true # idempotent: re-running a tag whose version is already on PyPI is a no-op
+
+  tag:
+    # Manual runs publish first, then record the release as a tag on the exact
+    # commit that was built. A tag pushed with GITHUB_TOKEN does not re-trigger
+    # this workflow, so the tag path cannot publish the same version twice.
+    name: Tag the published version
+    needs: publish
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create v<version> at the published commit
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$VERSION" "$GITHUB_SHA" -m "v$VERSION"
+          git push origin "v$VERSION"
