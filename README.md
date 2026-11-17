@@ -127,6 +127,10 @@ Runnable: [`examples/three_city_economy.py`](./examples/three_city_economy.py).
 - **Unlinkable disclosure.** Selective disclosure of *which receipts happened* ships today
   via Merkle inclusion proofs (below); an unlinkable / BBS+ variant and a zero-knowledge
   *score* proof are future properties; see [`SPEC.md`](./SPEC.md).
+- **Verify with standard VC tools.** The proof is labelled `Ed25519Signature2020`, but it
+  signs the JCS-canonical credential (without `proof`) and carries a base64 `proofValue`,
+  so standard VC tools won't verify it; use `verify_credential_proof`. Migration to the
+  W3C `eddsa-jcs-2022` cryptosuite is planned.
 
 ## Features
 
